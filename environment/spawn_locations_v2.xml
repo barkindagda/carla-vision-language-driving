@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<scenarios>
+    <scenario name="1" road_id="12" town="Town02">
+        <ego_vehicle x="-24.862138748168945" y="69.78325653076172" z="2.0" pitch="0" yaw="359" roll="0" model="vehicle.lincoln.mkz_2017" />
+        <goal_point x="27.137819290161133" y="69.78325653076172" z="0"/>
+        <pedestrian xmin="-8" xmax="0" y="73" z="1.22" orientation="horizontal"/>
+    </scenario>
+    <scenario name="2.2" road_id="12" town="Town02">
+        <ego_vehicle x="-48.64543151855469" y="92" z="0.2" pitch="0" yaw="359" roll="0" model="vehicle.lincoln.mkz_2017" />
+        <goal_point x="-48.64543151855469" y="130" z="1"/>
+        <vehicle_spawn ymin="59.73512649536133" ymax="85.73512649536133"/>
+        <pedestrian x="-57.186256408691406" ymin="118" ymax="118" z="1"  orientation="vertical"/>
+        <obsticle_spawn x="-52.073021" y="101" z="0.2"/>
+        <crowd_spawn ymin=  "40" ymax= "120" r1x= "-57.186256408691406" r2x= "-33.673221588134766"/>
+    </scenario>
+    <scenario name="2" road_id="12" town="Town02">
+        <ego_vehicle x="-48.64543151855469" y="72" z="0.2" pitch="0" yaw="359" roll="0" model="vehicle.lincoln.mkz_2017" />
+        <goal_point x="-48.64543151855469" y="139" z="1"/>
+        <vehicle_spawn ymin="59.73512649536133" ymax="85.73512649536133"/>
+        <pedestrian x="-57.186256408691406" ymin="118" ymax="118" z="1"  orientation="vertical"/>
+        <obsticle_spawn x="-52.073021" y="110" z="0.2"/>
+        <crowd_spawn ymin=  "40" ymax= "120" r1x= "-57.186256408691406" r2x= "-33.673221588134766"/>
+    </scenario>
+    <scenario name="3" road_id="12" town="Town02">
+        <ego_vehicle x="-24.862138748168945" y="69.78325653076172" z="2.0" pitch="0" yaw="359" roll="0" model="vehicle.lincoln.mkz_2017" />
+        <goal_point x="-48.64543151855469" y="105" z="1"/>
+        <pedestrian xmin="-10" xmax="0" y="73" z="1.22" orientation="horizontal"/>
+        <obsticle_spawn x="-52.073021" y="60" z="1"/>
+    </scenario>
+    
+</scenarios>
+

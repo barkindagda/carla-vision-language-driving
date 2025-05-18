@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+	<route id="0" town="Town01">
+		<waypoint x="-48.64543151855469" y="85.7350959777832" z="0.0" road_option="3"/>
+		<waypoint x="-48.64543151855469" y="100.23788833618164" z="0.0" road_option="3"/>
+		<waypoint x="-48.64543151855469" y="142" z="0.0" road_option="3"/>
+	</route>
+	<route id="1" town="Town01">
+		<waypoint x="-52.16093063354492" y="60.7350959777832" z="0.0" road_option="3"/>
+		<waypoint x="-52.16093063354492" y="105" z="0.0" road_option="3"/>
+	</route>
+</routes>
+
