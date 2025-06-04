@@ -1,1 +1,0 @@
-# carla-vision-language-driving
