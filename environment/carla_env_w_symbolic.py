@@ -14,6 +14,7 @@ import torchvision.transforms as T
 import xml.etree.ElementTree as ET
 import glob
 import re
+import queue
 from environment.global_route_planner import GlobalRoutePlanner
 from environment.local_planner import LocalPlanner, RoadOption
 from environment.controller import PIDLateralController
@@ -511,6 +512,11 @@ class CarlaEnv(gym.Env):
         self.current_vlm_action_value = 0.0  # Initialize default VLM action value
         self.current_vlm_action = "MAINTAIN"
         self.current_vlm_justification = "Starting the journey safely."
+
+        if self.vlm_controller is not None and hasattr(self.vlm_controller,'reset_episode_state'):
+            if hasattr(self.vlm_controller,'verbose') and self.vlm_controller.verbose:
+                print(f"[CarlaEnv] Episode {self.episode_counter}: Calling vlm_controller reset episode")
+            self.vlm_controller.reset_episode_state()
         
         # Clean up existing sensors
         if self.camera_sensor is not None:

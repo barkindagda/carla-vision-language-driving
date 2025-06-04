@@ -1,0 +1,57 @@
+cat > .gitignore << 'EOF'
+# Exclude result and environment folders
+vlm_outputs/
+wandb/
+carla_vlm.venv/
+=*/
+checkpoints/
+frames/
+logs/
+results/
+
+# Python-specific
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+
+# Checkpoint and model files
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.h5
+
+# Environment-specific
+.env
+.venv
+venv/
+ENV/
+
+# IDE-specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# System-specific
+.DS_Store
+Thumbs.db
+EOF

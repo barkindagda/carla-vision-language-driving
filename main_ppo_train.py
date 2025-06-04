@@ -1,69 +1,80 @@
+#!/usr/bin/env python3
+"""
+CARLA VLM-Enhanced PPO Training Script with Diagnostics
+Optimized integration of VLM with PPO for autonomous driving
+"""
+
 import os
+import sys
 import time
-import numpy as np
-import jax
-import jax.numpy as jnp
-import jax.random as random
-import flax.linen as nn
-from flax.training.train_state import TrainState
-import gymnasium as gym
-import optax
-import distrax
-import wandb
-from pathlib import Path
-from functools import partial
 import pickle
-import datetime
+import json
+import numpy as np
+import torch
+import wandb
+from datetime import datetime
+from tqdm import tqdm
 
-# Import components
-from environment.carla_env_w_symbolic import CarlaEnv, SymbolicRules
+# Stable Baselines3 imports
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import VecMonitor
+
+# Import your CARLA environment and VLM controller
+sys.path.append('/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/CarlaEnv')
+from environment.carla_env_w_symbolic import CarlaEnvironment
 from Models.vlm_controller_symbolic import VLMController
-from Models.PPO_agent import PPO, outer_loop, ActorNet, ValueNet
 
-#############################################
-# CONFIGURATION FLAGS - Easily adjustable
-#############################################
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# Experiment identification
-EXPERIMENT_NAME = "carla_vlm_ppo"
-TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+# Experiment Configuration
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+EXPERIMENT_NAME = f"carla_vlm_ppo_{TIMESTAMP}"
+TOTAL_TIMESTEPS = 100000
+CHECKPOINT_INTERVAL = 10000
+EARLY_CHECKPOINT_INTERVAL = 1000
+EARLY_CHECKPOINT_THRESHOLD = 10000
 
-# Environment settings
+# PPO Configuration
+PPO_CONFIG = {
+    "learning_rate": 1e-4,
+    "n_steps": 2048,
+    "batch_size": 64,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.3,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "verbose": 0,
+    "policy": "MlpPolicy",
+    "policy_kwargs": {
+        "net_arch": {"pi": [256, 256], "vf": [256, 256]},
+        "activation_fn": torch.nn.ReLU
+    }
+}
+
+# Environment Configuration
 ENV_RENDER_MODE = None
-ENV_VLM_FRAMES = 3
-ENV_USE_SYMBOLIC_REWARDS = False    # Use symbolic rules for reward components
-ENV_USE_VLM_WEIGHTS = True        # Use VLM to determine reward weights
-ENV_USE_VLM_ACTIONS = False        # Use PPO for actions (not VLM)
-ENV_NORMALIZE_REWARDS = True       # Apply reward normalization
+ENV_USE_VLM_WEIGHTS = True
+ENV_USE_VLM_ACTIONS = False
+ENV_OBS_SHAPE = (512,)
+NORMALIZE_REWARD = True
 
-# VLM controller settings
+# VLM Configuration
 VLM_MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA3-2B-Image"
-VLM_UPDATE_FREQUENCY = 10          # Update weights every 10 timesteps
+VLM_UPDATE_FREQUENCY = 5
 VLM_FRAMES_NEEDED = 3
 VLM_MAX_TOKENS = 512
 VLM_VERBOSE = False
 
-# PPO training settings
-PPO_TRAINING_STEPS = 200_000
-PPO_NUM_ENVS = 1
-PPO_ROLLOUT_STEPS = 1024  # Reduced for memory constraints
-PPO_BATCH_SIZE = 32       # Reduced for memory constraints
-PPO_EPOCHS = 10           # Reduced for memory constraints
-PPO_CLIP_RANGE = 0.2
-PPO_MAX_GRAD_NORM = 0.5
-PPO_GAMMA = 0.99
-PPO_LAMBDA = 0.95
-PPO_LEARNING_RATE = 3e-4
-PPO_VALUE_COEF = 0.5
-PPO_ENTROPY_COEF = 0.01
-PPO_LOG_VIDEO = False
-PPO_ENABLE_LOGGING = True
-
-# Base directory structure (matching existing project)
+# Paths
 PROJECT_BASE_DIR = "/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/VLM_Action"
 VLM_OUTPUT_DIR = os.path.join(PROJECT_BASE_DIR, "vlm_outputs")
-
-# Run-specific directories with timestamps 
 FRAMES_DIR = os.path.join(VLM_OUTPUT_DIR, "frames", f"ppo_{TIMESTAMP}")
 PPO_TRAINING_DIR = os.path.join(VLM_OUTPUT_DIR, "PPO_training", f"run_{TIMESTAMP}")
 WEIGHTS_DIR = os.path.join(PPO_TRAINING_DIR, "weights")
@@ -71,430 +82,463 @@ CHECKPOINTS_DIR = os.path.join(PPO_TRAINING_DIR, "checkpoints")
 LOGS_DIR = os.path.join(PPO_TRAINING_DIR, "logs")
 VLM_LOG_FILE = os.path.join(VLM_OUTPUT_DIR, f"vlm_decisions_{TIMESTAMP}.json")
 
-# Checkpoint frequency (steps)
-CHECKPOINT_INTERVAL = 5000
-EARLY_CHECKPOINT_INTERVAL = 1000
-EARLY_CHECKPOINT_THRESHOLD = 10000  # More frequent saves until this step
+# WandB Configuration
+WANDB_PROJECT = "carla-vlm-ppo"
 
-# Add the custom wrapper for reward conversion
-class ScalarRewardWrapper(gym.Wrapper):
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        # Ensure reward is a scalar
-        if isinstance(reward, (np.ndarray, list)):
-            reward = float(reward[0] if isinstance(reward, list) else reward.item())
-        return obs, reward, terminated, truncated, info
+# ============================================================================
+# HELPER CLASSES AND FUNCTIONS
+# ============================================================================
 
-# Add a wrapper to resize observations to reduce memory
-class ResizeObservationWrapper(gym.ObservationWrapper):
-    def __init__(self, env, size=(192, 192)):
-        super().__init__(env)
-        self.size = size
-        
-        # Update observation space
-        shape = env.observation_space.shape
-        self.observation_space = gym.spaces.Box(
-            low=0, high=255, 
-            shape=(shape[0], size[0], size[1]), 
-            dtype=np.uint8
-        )
-    def observation(self, observation):
-        # Resize the observation using NumPy (more compatible than PIL)
-        # Move channels to last dimension for resize
-        obs_hwc = np.transpose(observation, (1, 2, 0))
-        # Resize using OpenCV
-        import cv2
-        resized = cv2.resize(obs_hwc, self.size, interpolation=cv2.INTER_AREA)
-        # Move channels back to first dimension
-        return np.transpose(resized, (2, 0, 1))
-
-def main():
-    """
-    Main training script that integrates CARLA environment, VLM controller, 
-    and PPO agent for autonomous driving with symbolic rewards.
-    """
-    print("Starting CARLA VLM-guided PPO training...")
+class RunningStat:
+    """Tracks running mean and variance for reward normalization"""
+    def __init__(self, epsilon=1e-4):
+        self.mean = 0.0
+        self.std = 1.0
+        self.count = 0
+        self.epsilon = epsilon
     
-    # Create all output directories
+    def update(self, x):
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / self.count
+        delta2 = x - self.mean
+        self.std = np.sqrt(self.std**2 + (delta * delta2 - self.std**2) / self.count)
+        self.std = max(self.std, self.epsilon)
+
+def read_vlm_decisions_from_file(json_file_path):
+    """Read VLM decisions from JSON file"""
+    try:
+        if os.path.exists(json_file_path):
+            with open(json_file_path, 'r') as f:
+                decisions = json.load(f)
+                if decisions:
+                    return decisions[-1] if isinstance(decisions, list) else decisions
+        return None
+    except Exception as e:
+        wandb.log({"error/vlm_decision_read": str(e)})
+        return None
+
+# ============================================================================
+# CUSTOM CALLBACK FOR METRICS AND PROGRESS
+# ============================================================================
+
+class ProgressPPOCallback(BaseCallback):
+    """Callback for metrics, progress bar updates, and minimal console output"""
+    
+    def __init__(self, total_timesteps, progress_bar, vlm_controller=None):
+        super(ProgressPPOCallback, self).__init__(verbose=0)
+        self.total_timesteps = total_timesteps
+        self.progress_bar = progress_bar
+        self.vlm_controller = vlm_controller
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.current_episode_reward = 0
+        self.current_episode_steps = 0
+        self.first_vlm_update_checked = False
+        self.weight_history = []
+        self.vlm_updates_per_episode = 0
+        self.current_episode = 0
+        self.reward_stat = RunningStat() if NORMALIZE_REWARD else None
+    
+    def _on_step(self) -> bool:
+        self.progress_bar.update(1)
+        
+        if hasattr(self.locals, 'rewards') and self.locals['rewards'] is not None:
+            raw_reward = float(self.locals['rewards'][0])
+            
+            # Reward processing
+            clipped_reward = np.clip(raw_reward, -10.0, 10.0)
+            if NORMALIZE_REWARD:
+                self.reward_stat.update(clipped_reward)
+                normalized_reward = np.clip(
+                    (clipped_reward - self.reward_stat.mean) / (self.reward_stat.std + 1e-8),
+                    -5.0, 5.0
+                )
+                step_reward = normalized_reward
+            else:
+                step_reward = clipped_reward
+            
+            self.current_episode_reward += step_reward
+            self.current_episode_steps += 1
+            
+            wandb.log({
+                "reward/raw": raw_reward,
+                "reward/clipped": clipped_reward,
+                "reward/normalized": step_reward if NORMALIZE_REWARD else clipped_reward,
+                "episode_progress": self.current_episode_reward
+            }, step=self.num_timesteps)
+            
+        if (not self.first_vlm_update_checked and 
+            ENV_USE_VLM_WEIGHTS and 
+            self.num_timesteps >= VLM_UPDATE_FREQUENCY and 
+            self.num_timesteps % VLM_UPDATE_FREQUENCY == 0):
+            try:
+                if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
+                    env = self.training_env.envs[0]
+                    while hasattr(env, 'env'):
+                        env = env.env
+                    
+                    frame_count = len(env.frame_buffer) if hasattr(env, 'frame_buffer') and env.frame_buffer else 0
+                    saved_frames = []
+                    frame_paths = []
+                    if hasattr(env, 'frame_save_dir') and os.path.exists(env.frame_save_dir):
+                        saved_frames = [f for f in os.listdir(env.frame_save_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+                        frame_paths = [os.path.join(env.frame_save_dir, f) for f in saved_frames[-VLM_FRAMES_NEEDED:]]
+                    
+                    vlm_active = False
+                    weights = None
+                    if hasattr(env, 'vlm_controller') and hasattr(env.vlm_controller, 'log_file'):
+                        vlm_decision = read_vlm_decisions_from_file(env.vlm_controller.log_file)
+                        if vlm_decision and 'weights' in vlm_decision:
+                            weights = vlm_decision['weights']
+                            vlm_active = True
+                            self.vlm_updates_per_episode += 1
+                    
+                    print(f"✅ First VLM Update (Step {self.num_timesteps}):")
+                    print(f"   Frame Buffer: {frame_count} frames")
+                    print(f"   Saved Frames: {len(saved_frames)} in {getattr(env, 'frame_save_dir', 'Not set')}")
+                    if frame_paths:
+                        print(f"   Processed Frames: {' → '.join([os.path.basename(p) for p in frame_paths])}")
+                    print(f"   VLM Active: {'Yes' if vlm_active else 'No'}")
+                    if weights:
+                        print(f"   VLM Weights: Safety={weights.get('w1', weights.get('safety', 1.0)):.3f}, "
+                              f"Comfort={weights.get('w2', weights.get('comfort', 1.0)):.3f}, "
+                              f"Efficiency={weights.get('w3', weights.get('efficiency', 1.0)):.3f}")
+                    
+                    wandb.log({
+                        "debug/frame_buffer_size": frame_count,
+                        "debug/saved_frame_count": len(saved_frames),
+                        "debug/vlm_active": 1.0 if vlm_active else 0.0
+                    }, step=self.num_timesteps)
+                    
+                    if hasattr(env, 'vlm_controller'):
+                        env.vlm_controller.first_update_verbose = False
+                    
+                    self.first_vlm_update_checked = True
+                    
+            except Exception as e:
+                wandb.log({"error/first_vlm_check": str(e)})
+        
+        if ENV_USE_VLM_WEIGHTS and self.num_timesteps % 50 == 0:
+            try:
+                if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
+                    env = self.training_env.envs[0]
+                    while hasattr(env, 'env'):
+                        env = env.env
+                    
+                    weights = None
+                    if hasattr(env, 'vlm_controller') and hasattr(env.vlm_controller, 'log_file'):
+                        vlm_decision = read_vlm_decisions_from_file(env.vlm_controller.log_file)
+                        if vlm_decision and 'weights' in vlm_decision:
+                            weights = vlm_decision['weights']
+                            if weights != self.weight_history[-1]['weights'] if self.weight_history else True:
+                                self.vlm_updates_per_episode += 1
+                    
+                    if weights is None and hasattr(env, 'get_current_weights'):
+                        weights = env.get_current_weights()
+                    
+                    if weights is None and hasattr(env, 'previous_vlm_weights'):
+                        weights = env.previous_vlm_weights
+                    
+                    if weights and isinstance(weights, dict):
+                        w1 = weights.get("w1", weights.get("safety", 1.0))
+                        w2 = weights.get("w2", weights.get("comfort", 1.0)) 
+                        w3 = weights.get("w3", weights.get("efficiency", 1.0))
+                        
+                        if not (w1 == 1.0 and w2 == 1.0 and w3 == 1.0):
+                            wandb.log({
+                                "vlm/safety_weight": w1,
+                                "vlm/comfort_weight": w2,
+                                "vlm/efficiency_weight": w3,
+                                "vlm/weights_active": 1.0,
+                                "vlm/updates_per_episode": self.vlm_updates_per_episode
+                            }, step=self.num_timesteps)
+                            
+                            self.weight_history.append({
+                                "step": self.num_timesteps,
+                                "weights": {"w1": w1, "w2": w2, "w3": w3},
+                                "justification": weights.get("justification", ""),
+                                "timestamp": time.time()
+                            })
+                        else:
+                            wandb.log({"vlm/weights_active": 0.0}, step=self.num_timesteps)
+                    
+                    if hasattr(env, 'frame_buffer'):
+                        frame_count = len(env.frame_buffer) if env.frame_buffer else 0
+                        saved_frames = []
+                        if hasattr(env, 'frame_save_dir') and os.path.exists(env.frame_save_dir):
+                            saved_frames = [f for f in os.listdir(env.frame_save_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+                        
+                        wandb.log({
+                            "debug/frame_buffer_size": frame_count,
+                            "debug/saved_frame_count": len(saved_frames)
+                        }, step=self.num_timesteps)
+                            
+            except Exception as e:
+                wandb.log({"error/vlm_tracking": str(e)})
+
+        if hasattr(self.locals, 'dones') and self.locals['dones'] is not None:
+            if self.locals['dones'][0]:
+                # Reset VLM controller state for new episode
+                try:
+                    if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
+                        env = self.training_env.envs[0]
+                        while hasattr(env, 'env'):
+                            env = env.env
+                        if hasattr(env, 'vlm_controller') and hasattr(env.vlm_controller, 'last_update_step'):
+                            env.vlm_controller.last_update_step = 0
+                except Exception as e:
+                    wandb.log({"error/vlm_reset": str(e)})
+                
+                self.episode_rewards.append(self.current_episode_reward)
+                self.episode_lengths.append(self.current_episode_steps)
+                
+                avg_reward_per_step = self.current_episode_reward / max(1, self.current_episode_steps)
+                
+                wandb.log({
+                    "episode_reward": self.current_episode_reward,
+                    "episode_length": self.current_episode_steps,
+                    "reward_per_step": avg_reward_per_step,
+                    "episodes": len(self.episode_rewards),
+                    "vlm/updates_per_episode": self.vlm_updates_per_episode
+                }, step=self.num_timesteps)
+                
+                if len(self.episode_rewards) >= 10:
+                    wandb.log({
+                        "mean_reward_10": np.mean(self.episode_rewards[-10:]),
+                        "std_reward_10": np.std(self.episode_rewards[-10:])
+                    }, step=self.num_timesteps)
+                
+                if len(self.episode_rewards) >= 100:
+                    wandb.log({
+                        "mean_reward_100": np.mean(self.episode_rewards[-100:])
+                    }, step=self.num_timesteps)
+                
+                print(f"Episode {len(self.episode_rewards)}: Reward={self.current_episode_reward:.2f}, "
+                      f"Steps={self.current_episode_steps}, Avg={avg_reward_per_step:.3f}, "
+                      f"VLM Updates={self.vlm_updates_per_episode}")
+                
+                self.current_episode_reward = 0
+                self.current_episode_steps = 0
+                self.vlm_updates_per_episode = 0
+                self.current_episode += 1
+        
+        save_checkpoint = (
+            self.num_timesteps % CHECKPOINT_INTERVAL == 0 or
+            self.num_timesteps == self.total_timesteps - 1 or
+            (self.num_timesteps < EARLY_CHECKPOINT_THRESHOLD and
+             self.num_timesteps % EARLY_CHECKPOINT_INTERVAL == 0)
+        )
+        
+        if save_checkpoint:
+            checkpoint_path = os.path.join(CHECKPOINTS_DIR, f"checkpoint_${self.num_timesteps}.zip")
+            self.model.save(checkpoint_path)
+            wandb.save(checkpoint_path)
+            
+            if self.weight_history:
+                weight_history_path = os.path.join(WEIGHTS_DIR, f"weight_history_${self.num_timesteps}.pkl")
+                with open(weight_history_path, "wb") as f:
+                    pickle.dump(self.weight_history, f)
+                wandb.save(weight_history_path)
+        
+        return True
+    
+    def _on_rollout_end(self):
+        try:
+            if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
+                ppo_metrics = self.model.logger.name_to_value
+                metrics_to_log = {}
+                for key, value in ppo_metrics.items():
+                    if any(metric in key.lower() for metric in 
+                          ['policy_loss', 'value_loss', 'entropy', 'explained_variance', 'learning_rate']):
+                        metrics_to_log[f"ppo/{key}"] = value
+                if metrics_to_log:
+                    wandb.log(metrics_to_log, step=self.num_timesteps)
+            
+            if self.episode_rewards:
+                wandb.log({
+                    "rollout/episodes_this_rollout": len(self.episode_rewards),
+                    "rollout/mean_episode_reward": np.mean(self.episode_rewards[-10:]) if len(self.episode_rewards) >= 10 else np.mean(self.episode_rewards),
+                    "rollout/total_episodes": len(self.episode_rewards)
+                }, step=self.num_timesteps)
+        except Exception as e:
+            wandb.log({"error/rollout_logging": str(e)})
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def setup_directories():
+    """Create necessary directories"""
     for directory in [VLM_OUTPUT_DIR, FRAMES_DIR, PPO_TRAINING_DIR, WEIGHTS_DIR, CHECKPOINTS_DIR, LOGS_DIR]:
         os.makedirs(directory, exist_ok=True)
+
+def add_vlm_method_to_env():
+    """Add VLM integration methods to environment"""
     
-    print(f"VLM output directory: {VLM_OUTPUT_DIR}")
-    print(f"Frames will be saved to: {FRAMES_DIR}")
-    print(f"PPO training directory: {PPO_TRAINING_DIR}")
-    print(f"Weights will be saved to: {WEIGHTS_DIR}")
-    print(f"Checkpoints will be saved to: {CHECKPOINTS_DIR}")
+    def get_current_weights(self):
+        sources_to_try = [
+            ('previous_vlm_weights', 'Previous VLM weights'),
+            ('vlm_weights', 'Current VLM weights'),
+            ('current_weights', 'Current weights'),
+            ('last_vlm_weights', 'Last VLM weights')
+        ]
+        
+        for attr_name, _ in sources_to_try:
+            if hasattr(self, attr_name):
+                weights = getattr(self, attr_name)
+                if weights is not None and isinstance(weights, dict):
+                    return weights
+        
+        return getattr(self, 'default_weights', {"w1": 1.0, "w2": 1.0, "w3": 1.0})
+
+    def get_vlm_decision_file_path(self):
+        if hasattr(self, 'vlm_controller') and hasattr(self.vlm_controller, 'log_file'):
+            return self.vlm_controller.log_file
+        return VLM_LOG_FILE
+
+    if not hasattr(CarlaEnvironment, 'get_current_weights'):
+        setattr(CarlaEnvironment, 'get_current_weights', get_current_weights)
+    if not hasattr(CarlaEnvironment, 'get_vlm_decision_file_path'):
+        setattr(CarlaEnvironment, 'get_vlm_decision_file_path', get_vlm_decision_file_path)
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+
+def main():
+    """Main training function with optimized output"""
+    print(f"🚖 CARLA VLM-Enhanced PPO Training: {EXPERIMENT_NAME}")
     
-    #######################
-    # Environment Setup #
-    #######################
+    # Setup
+    setup_directories()
+    add_vlm_method_to_env()
     
-    # Environment configuration from flags
-    env_config = {
-        "render_mode": ENV_RENDER_MODE,
-        "vlm_frames": ENV_VLM_FRAMES,
-        "use_symbolic_rewards": ENV_USE_SYMBOLIC_REWARDS,
-        "use_vlm_weights": ENV_USE_VLM_WEIGHTS,
-        "use_vlm_actions": ENV_USE_VLM_ACTIONS,
-        "normalize_rewards": ENV_NORMALIZE_REWARDS
-    }
+    # Initialize WandB
+    wandb.init(
+        project=WANDB_PROJECT,
+        name=EXPERIMENT_NAME,
+        config={
+            **PPO_CONFIG,
+            "total_timesteps": TOTAL_TIMESTEPS,
+            "env_use_vlm_weights": ENV_USE_VLM_WEIGHTS,
+            "env_use_vlm_actions": ENV_USE_VLM_ACTIONS,
+            "vlm_update_frequency": VLM_UPDATE_FREQUENCY,
+            "vlm_model": VLM_MODEL_NAME,
+            "normalize_reward": NORMALIZE_REWARD,
+            "experiment_name": EXPERIMENT_NAME,
+            "frames_dir": FRAMES_DIR,
+            "ppo_training_dir": PPO_TRAINING_DIR,
+            "weights_dir": WEIGHTS_DIR,
+            "checkpoints_dir": CHECKPOINTS_DIR,
+            "logs_dir": LOGS_DIR
+        },
+        tags=["PPO", "CARLA", "VLM", "autonomous-driving"],
+        dir=LOGS_DIR
+    )
     
-    # VLM controller configuration from flags
+    # Create VLM controller
     vlm_config = {
         "model_name": VLM_MODEL_NAME,
         "update_frequency": VLM_UPDATE_FREQUENCY,
         "frames_needed": VLM_FRAMES_NEEDED,
         "output_dir": VLM_OUTPUT_DIR,
         "max_new_tokens": VLM_MAX_TOKENS,
-        "verbose": VLM_VERBOSE
+        "verbose": VLM_VERBOSE,
+        "log_file": VLM_LOG_FILE,
+        "first_update_verbose": True
     }
     
-    # PPO agent configuration from flags
-    ppo_config = {
-        "env_id": "CarlaEnv-v0",
-        "training_steps": PPO_TRAINING_STEPS,
-        "n_envs": PPO_NUM_ENVS,
-        "rollout_steps": PPO_ROLLOUT_STEPS,
-        "batch_size": PPO_BATCH_SIZE,
-        "clip_range": PPO_CLIP_RANGE,
-        "epochs": PPO_EPOCHS,
-        "max_grad_norm": PPO_MAX_GRAD_NORM,
-        "gamma": PPO_GAMMA,
-        "vf_clip_range": np.inf,
-        "ent_coef": PPO_ENTROPY_COEF,
-        "gae_lambda": PPO_LAMBDA,
-        "learning_rate": PPO_LEARNING_RATE,
-        "vf_coef": PPO_VALUE_COEF,
-        "log_video": PPO_LOG_VIDEO,
-        "log": PPO_ENABLE_LOGGING
-    }
-    
-    # Add method to CarlaEnv to get current weights
-    def get_current_weights(self):
-        """Helper method to get current weights being used"""
-        if hasattr(self, 'previous_vlm_weights'):
-            return self.previous_vlm_weights
-        return self.default_weights
-    
-    # Add the method to CarlaEnv class
-    setattr(CarlaEnv, 'get_current_weights', get_current_weights)
-    
-    # Register the CARLA environment with Gymnasium
-    gym.register(
-        id='CarlaEnv-v0',
-        entry_point='environment.carla_env_w_symbolic:CarlaEnv',
-        max_episode_steps=1000,
-    )
-    
-    # Create VLM controller first, so we can pass it to environments
     vlm_controller = VLMController(**vlm_config)
     
-    def make_wrapped_env():
-        # Create the environment with all configuration parameters
-        env = gym.make('CarlaEnv-v0', 
-                    render_mode=ENV_RENDER_MODE, 
-                    vlm_frames=ENV_VLM_FRAMES,
-                    use_symbolic_rewards=ENV_USE_SYMBOLIC_REWARDS,
-                    use_vlm_weights=ENV_USE_VLM_WEIGHTS,
-                    use_vlm_actions=ENV_USE_VLM_ACTIONS,
-                    normalize_rewards=ENV_NORMALIZE_REWARDS)
-        
-        # Get unwrapped env for direct access
-        carla_env = env.unwrapped
-        
-        # Set frames directory for saving images
-        carla_env.frame_save_dir = FRAMES_DIR
-        
-        # Configure the VLM controller
-        carla_env.vlm_controller = vlm_controller
-        
-        # Initialize episode counter if not present
-        if not hasattr(carla_env, 'episode_counter'):
-            carla_env.episode_counter = 0
-            
-        # Add observation resize wrapper to reduce memory usage
-        env = ResizeObservationWrapper(env, size=(192, 192))
-        
-        # Add scalar reward wrapper to ensure PPO compatibility
-        env = ScalarRewardWrapper(env)
-        
-        # Add episode statistics tracking
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        
+    # Create environment
+    def make_env():
+        env = CarlaEnvironment(
+            render_mode=ENV_RENDER_MODE,
+            use_vlm_weights=ENV_USE_VLM_WEIGHTS,
+            use_vlm_actions=ENV_USE_VLM_ACTIONS
+        )
+        env.frame_save_dir = os.path.join(FRAMES_DIR)
+        env.vlm_controller = vlm_controller
+        env.episode_counter = 0
+        env.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=ENV_OBS_SHAPE, dtype=np.float32
+        )
         return env
     
-    # Create vectorized environment with wrapped environments
-    print("Creating vectorized environment...")
-    vectorized_env = gym.vector.SyncVectorEnv([make_wrapped_env for _ in range(PPO_NUM_ENVS)])
+    vec_env = make_vec_env(make_env, n_envs=1, seed=42)
+    vec_env = VecMonitor(vec_env, LOGS_DIR)
     
-    # Store a reference to the unwrapped environment for direct access
-    unwrapped_env = vectorized_env.envs[0].unwrapped
+    # Print summary
+    print("\n🔍 PPO Model Summary:")
+    print(f"   Observation Space: {vec_env.observation_space}")
+    print(f"   Action Space: {vec_env.action_space}")
     
-    # Initialize wandb for logging with all configuration details
-    if PPO_ENABLE_LOGGING:
-        # Combine all configs for comprehensive logging
-        combined_config = {
-            **ppo_config,
-            **vlm_config,
-            **env_config,
-            "output_dir": PROJECT_BASE_DIR,
-            "frames_dir": FRAMES_DIR,
-            "weights_dir": WEIGHTS_DIR,
-            "checkpoints_dir": CHECKPOINTS_DIR,
-            "logs_dir": LOGS_DIR
-        }
-        
-        print("Initializing wandb logging...")
-        wandb.init(
-            project=EXPERIMENT_NAME,
-            name=f"vlm-ppo-{TIMESTAMP}",
-            config=combined_config,
-            tags=["PPO", "CARLA", "VLM", "SymbolicRules"],
-            save_code=True,
-            dir=LOGS_DIR
-        )
-    
-    #######################
-    # Initialize Networks #
-    #######################
-    
-    print("Initializing PPO neural networks...")
-    # Get initial observation for network initialization
-    print("- Getting initial observation...")
-    obs, _ = vectorized_env.reset(seed=42)  # Set seed for deterministic initialization
-    key = random.PRNGKey(42)
-    
-    # Split random keys for actor and critic networks
-    actor_key, value_key, key = random.split(key, num=3)
-    
-    # Create neural networks with CNN feature extraction
-    print("- Creating actor and critic networks...")
-    actor_net = ActorNet(vectorized_env.single_action_space.shape[0])
-    value_net = ValueNet()
-    
-    # Verify that action space is correct for our needs (-1 to 1)
-    action_space = vectorized_env.single_action_space
-    if isinstance(action_space, gym.spaces.Box):
-        if not (action_space.low[0] == -1.0 and action_space.high[0] == 1.0):
-            print(f"WARNING: Action space range is {action_space.low[0]} to {action_space.high[0]}, expected -1.0 to 1.0")
-    else:
-        print(f"WARNING: Unexpected action space type: {type(action_space)}")
-    
-    # Create optimizer with learning rate schedule
-    print("- Creating optimizers...")
-    opt = optax.chain(
-        optax.clip_by_global_norm(PPO_MAX_GRAD_NORM),
-        optax.inject_hyperparams(optax.adamw)(
-            learning_rate=optax.linear_schedule(
-                init_value=PPO_LEARNING_RATE,
-                end_value=PPO_LEARNING_RATE / 10,
-                transition_steps=PPO_TRAINING_STEPS,
-            ),
-        ),
+    # Create PPO model
+    model = PPO(
+        PPO_CONFIG["policy"],
+        vec_env,
+        tensorboard_log=LOGS_DIR,
+        policy_kwargs=PPO_CONFIG["policy_kwargs"],
+        **{k: v for k, v in PPO_CONFIG.items() if k not in ["policy", "policy_kwargs"]}
     )
-  
-    # Create train states for actor and critic
-    print("- Initializing network parameters...")
-    actor_ts = TrainState.create(
-        apply_fn=actor_net.apply,
-        params=actor_net.init(actor_key, obs),
-        tx=opt)
-
-    value_ts = TrainState.create(
-        apply_fn=value_net.apply,
-        params=value_net.init(value_key, obs),
-        tx=opt)
     
-    #############################
-    # Initialize Training Loop #
-    #############################
+    # Initialize progress bar
+    progress_bar = tqdm(total=TOTAL_TIMESTEPS, desc="Training Progress", unit="step")
     
-    # Create PPO agent
-    print("Creating PPO agent...")
-    ppo_agent = PPO(buffer_size=PPO_NUM_ENVS * PPO_ROLLOUT_STEPS, **ppo_config)
+    # Create callback
+    callback = ProgressPPOCallback(total_timesteps=TOTAL_TIMESTEPS, progress_bar=progress_bar, vlm_controller=vlm_controller)
     
-    # Initialize environment
-    print("Resetting environment for training...")
-    last_obs, _ = vectorized_env.reset()
-    last_episode_starts = np.ones((PPO_NUM_ENVS,), dtype=bool)
-    current_global_step = 0
-    
-    # Training metrics
-    weight_history = []
-    episode_counter = 0
-    
-    # Main training loop
-    print("\n" + "="*50)
-    print("STARTING TRAINING")
-    print("="*50 + "\n")
+    # Start training
+    start_time = time.time()
     
     try:
-        while current_global_step < ppo_agent.training_steps:
-            print(f"\nStep: {current_global_step}/{ppo_agent.training_steps} (Episode: {episode_counter})")
-            
-            try:
-                ###############################
-                # PHASE 1: COLLECT EXPERIENCE
-                ###############################
-                print("Collecting rollout data...")
-                rollout, rollout_info = ppo_agent.get_rollout(
-                    actor_ts,
-                    value_ts,
-                    vectorized_env,
-                    last_obs,
-                    last_episode_starts,
-                    key,
-                )
-                
-                # Update step counter
-                current_global_step += ppo_agent.rollout_steps * ppo_agent.n_envs
-                
-                ################################
-                # PHASE 2: POLICY OPTIMIZATION
-                ################################
-                print("Updating policy with PPO...")
-                actor_ts, value_ts, key, training_info = outer_loop(
-                    key, actor_ts, value_ts, rollout, ppo_agent
-                )
-                
-                # Combine logs
-                full_logs = {**training_info, **rollout_info}
-                
-                ###############################
-                # PHASE 3: VLM WEIGHT UPDATES
-                ###############################
-                # Only log VLM weights if they're being used
-                if ENV_USE_VLM_WEIGHTS:
-                    try:
-                        # Get current weights - these are updated based on VLM_UPDATE_FREQUENCY
-                        weights = unwrapped_env.get_current_weights()
-                        
-                        # Only log the actual weights, not fallbacks
-                        if weights is not None:
-                            full_logs.update({
-                                "safety_weight": weights["w1"],
-                                "comfort_weight": weights["w2"],
-                                "efficiency_weight": weights["w3"],
-                                "weight_justification": weights.get("justification", "")[:100]
-                            })
-                            
-                            # Track weight history
-                            weight_history.append({
-                                "step": current_global_step,
-                                "episode": episode_counter,
-                                "weights": weights,
-                                "timestamp": time.time()
-                            })
-                            
-                            # Print actual VLM-determined weights
-                            print(f"Current VLM Weights - Safety: {weights['w1']:.2f}, "
-                                f"Comfort: {weights['w2']:.2f}, "
-                                f"Efficiency: {weights['w3']:.2f}")
-                    except Exception as e:
-                        print(f"Error accessing VLM weights: {e}")
-                
-                # Add VLM update frequency to logs
-                full_logs["vlm_update_frequency"] = VLM_UPDATE_FREQUENCY
-                
-                # Include information about reward normalization if enabled
-                if ENV_NORMALIZE_REWARDS and hasattr(unwrapped_env, 'reward_running_mean'):
-                    full_logs.update({
-                        "reward_mean": float(unwrapped_env.reward_running_mean),
-                        "reward_std": float(getattr(unwrapped_env, 'reward_running_std', 1.0))
-                    })
-                
-                # Print training information
-                print(f"Training metrics:")
-                print(f"- Rollout mean reward: {full_logs.get('mean rollout reward', 0):.4f}")
-                print(f"- Actor loss: {full_logs.get('actor_loss_total', 0):.4f}")
-                print(f"- Value loss: {full_logs.get('value_loss_total', 0):.4f}")
-                
-                # Increment episode counter if we've had any terminated episodes
-                if 'episodes' in rollout_info and rollout_info['episodes'] > 0:
-                    new_episodes = rollout_info['episodes']
-                    episode_counter += new_episodes
-                    print(f"Completed {new_episodes} new episodes (total: {episode_counter})")
-                    
-                    # Update episode counter in unwrapped env for frame naming
-                    if hasattr(unwrapped_env, 'episode_counter'):
-                        unwrapped_env.episode_counter = episode_counter
-                
-                ################################
-                # PHASE 4: LOGGING & CHECKPOINTS
-                ################################
-                if PPO_ENABLE_LOGGING:
-                    # Log to wandb
-                    wandb.log(full_logs, step=current_global_step)
-                    
-                    # Determine if we should save a checkpoint
-                    save_checkpoint = (
-                        current_global_step % CHECKPOINT_INTERVAL == 0 or 
-                        current_global_step == ppo_agent.training_steps - 1 or
-                        (current_global_step < EARLY_CHECKPOINT_THRESHOLD and 
-                         current_global_step % EARLY_CHECKPOINT_INTERVAL == 0)
-                    )
-                    
-                    if save_checkpoint:
-                        print(f"Saving checkpoint at step {current_global_step}...")
-                        checkpoint = {
-                            "actor_params": actor_ts.params,
-                            "value_params": value_ts.params,
-                            "step": current_global_step,
-                            "episode": episode_counter
-                        }
-                        checkpoint_path = os.path.join(CHECKPOINTS_DIR, f"checkpoint_{current_global_step}.pkl")
-                        with open(checkpoint_path, "wb") as f:
-                            pickle.dump(checkpoint, f)
-                        
-                        # Log checkpoint to wandb
-                        wandb.save(checkpoint_path)
-                        
-                        # Save weight history
-                        weight_history_path = os.path.join(WEIGHTS_DIR, f"weight_history_{current_global_step}.pkl")
-                        with open(weight_history_path, "wb") as f:
-                            pickle.dump(weight_history, f)
-                            
-                        print(f"Checkpoint saved to {checkpoint_path}")
-                    
-            except Exception as e:
-                print(f"Error during rollout or training step: {e}")
-                import traceback
-                traceback.print_exc()
-                
-                # Reset the environment on error with a unique seed
-                reset_seed = int(time.time()) % 10000
-                print(f"Resetting environment with seed {reset_seed}")
-                last_obs, _ = vectorized_env.reset(seed=reset_seed)
-                last_episode_starts = np.ones((PPO_NUM_ENVS,), dtype=bool)
-                time.sleep(2)  # Brief pause to allow system to stabilize
-    
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving final checkpoint...")
-        # Save final checkpoint
-        checkpoint = {
-            "actor_params": actor_ts.params,
-            "value_params": value_ts.params,
-            "step": current_global_step,
-            "episode": episode_counter
-        }
-        with open(os.path.join(CHECKPOINTS_DIR, "checkpoint_interrupted.pkl"), "wb") as f:
-            pickle.dump(checkpoint, f)
-    
-    finally:
-        # Cleanup
-        if PPO_ENABLE_LOGGING:
-            wandb.finish()
+        model.learn(
+            total_timesteps=TOTAL_TIMESTEPS,
+            callback=callback,
+            reset_num_timesteps=False,
+            tb_log_name="ppo_carla_vlm"
+        )
         
-        # Ensure environment is closed properly
-        vectorized_env.close()
-        
-        print("Training complete!")
+        # Save final model
+        final_model_path = os.path.join(CHECKPOINTS_DIR, "ppo_final_model.zip")
+        model.save(final_model_path)
+        wandb.save(final_model_path)
         
         # Save final weight history
-        if weight_history:
-            weight_history_path = os.path.join(CHECKPOINTS_DIR, "weight_history_final.pkl")
+        if callback.weight_history:
+            weight_history_path = os.path.join(WEIGHTS_DIR, "weight_history_final.pkl")
             with open(weight_history_path, "wb") as f:
-                pickle.dump(weight_history, f)
+                pickle.dump(callback.weight_history, f)
+            wandb.save(weight_history_path)
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted by user")
+        interrupted_model_path = os.path.join(CHECKPOINTS_DIR, "ppo_interrupted_model.zip")
+        model.save(interrupted_model_path)
+        wandb.save(interrupted_model_path)
+        
+        if callback.weight_history:
+            weight_history_path = os.path.join(WEIGHTS_DIR, "weight_history_interrupted.pkl")
+            with open(weight_history_path, "wb") as f:
+                pickle.dump(callback.weight_history, f)
+            wandb.save(weight_history_path)
+    
+    # Close progress bar
+    progress_bar.close()
+    
+    # Training summary
+    total_time = time.time() - start_time
+    print(f"\n🎉 Training Completed!")
+    print(f"   Duration: {total_time/3600:.2f} hours")
+    print(f"   Episodes: {len(callback.episode_rewards)}")
+    if callback.episode_rewards:
+        print(f"   Final Episode Reward: {callback.episode_rewards[-1]:.2f}")
+        print(f"   Best Episode Reward: {max(callback.episode_rewards):.2f}")
+    
+    # Cleanup
+    vec_env.close()
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

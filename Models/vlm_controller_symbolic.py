@@ -36,6 +36,7 @@ class VLMController:
         self.output_dir = output_dir
         self.max_new_tokens = max_new_tokens
         self.verbose = verbose
+        self.last_update_timestep = 0 # Initialize here
 
         # Create timestamped output directory
         timestamp = int(time.time())
@@ -182,6 +183,8 @@ class VLMController:
                 **fallback,
                 "sequence_id": f"error_{int(time.time())}"
             }
+    def reset_episode_state(self):
+        self.last_update_timestep=0-self.update_frequency
             
     def get_reward_weights(self, vehicle_state, frame_buffer=None, carla_env=None):
         """
@@ -536,7 +539,6 @@ JUSTIFICATION: [Explanation based on frames and context]
             "action_value": action_value,
             "justification": justification
         }
-
     def _log_decision(self, vlm_result, vehicle_state, carla_env=None):
         """
         Log essential VLM decision data in a clean, focused format.
