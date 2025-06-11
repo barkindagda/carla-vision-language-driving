@@ -25,8 +25,8 @@ from Models.vlm_controller_symbolic import VLMController
 # Configuration constants
 IM_WIDTH = 300
 IM_HEIGHT = 300
-SPAWN_LOCATIONS = "/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/VLM_Action/environment/spawn_locations_v2.xml"
-ROUTES = "/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/VLM_Action/environment/routes.xml"
+SPAWN_LOCATIONS = "./environment/spawn_locations_v2.xml"
+ROUTES = "./environment/routes.xml"
 TRAFFIC = True
 OCCLUSION = True
 MOVING_OCC = False
