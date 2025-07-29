@@ -1,23 +1,22 @@
 import os
 import time
-import queue
-import random
 import json
 import re
 import torch
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 
 class VLMController:
     """
     Vision Language Model controller for autonomous vehicle decision-making
-    using VideoLLaMA to process sequences of frames from CARLA.
+    using Qwen2.5-VL to process sequences of frames from CARLA.
     """
 
     def __init__(
             self,
-            model_name="DAMO-NLP-SG/VideoLLaMA3-2B-Image",
+            model_name="Qwen/Qwen2.5-VL-72B-Instruct",
             update_frequency=5,
             frames_needed=3,
             output_dir="/home/cavlab/CARLA_0.9.15/VLM_Barkin/CarlaEnv/vlm_outputs",
@@ -28,7 +27,7 @@ class VLMController:
         Initialize the VLM Controller.
 
         Args:
-            model_name: HuggingFace model name for VideoLLaMA
+            model_name: HuggingFace model name for Qwen2.5-VL
             update_frequency: How often to update decisions (in timesteps)
             frames_needed: Number of frames to use for each decision
             output_dir: Directory to save outputs and logs
@@ -63,20 +62,20 @@ class VLMController:
         self._load_model()
 
     def _load_model(self):
-        """Load the VideoLLaMA model and processor."""
+        """Load the Qwen2.5-VL model and processor."""
         if self.verbose:
-            print(f"Loading VideoLLaMA model: {self.model_name}")
+            print(f"Loading Qwen2.5-VL model: {self.model_name}")
 
         try:
             # Load model
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_name,
-                torch_dtype=torch.bfloat16,
+                torch_dtype="auto",
                 device_map="auto",
                 trust_remote_code=True,
             )
 
-            # Load processor
+            # Load processor with default pixel range for performance
             self.processor = AutoProcessor.from_pretrained(
                 self.model_name,
                 trust_remote_code=True
@@ -116,10 +115,8 @@ class VLMController:
                 self.current_justification = vlm_result["justification"]
 
                 # Update the environment with new values
-                # Match attribute names between controller and environment
                 carla_env.current_vlm_action = self.current_action_text
                 carla_env.current_vlm_justification = self.current_justification
-                # Add the action value directly to the environment
                 carla_env.current_action_value = self.current_action_value
 
                 # Record update time
@@ -139,7 +136,7 @@ class VLMController:
 
     def process_frames(self, frame_paths, vehicle_state):
         """
-        Process a sequence of frames through VideoLLaMA.
+        Process a sequence of frames through Qwen2.5-VL.
 
         Args:
             frame_paths: List of paths to frame images
@@ -160,31 +157,27 @@ class VLMController:
 
             # Create content array with frame paths
             content = []
-
-            # Add each frame with a label
             for i, frame_path in enumerate(frame_paths):
+                content.append({"type": "image", "image": f"file://{frame_path}"})
                 content.append({"type": "text", "text": f"Frame{i + 1}: "})
-                content.append({"type": "image", "image": {"image_path": frame_path}})
-
-            # Add instruction
             content.append({"type": "text", "text": instruction})
 
             # Create conversation format
-            conversation = [
-                {
-                    "role": "user",
-                    "content": content
-                }
-            ]
+            messages = [{"role": "user", "content": content}]
 
-            # Process inputs
-            inputs = self.processor(conversation=conversation, return_tensors="pt")
-            inputs = {k: v.to(self.model.device) if isinstance(v, torch.Tensor) else v
-                      for k, v in inputs.items()}
-
-            # Handle pixel values
-            if "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].to(self.model.dtype)
+            # Prepare inputs for inference
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.model.device)
 
             # Generate output
             generated_ids = self.model.generate(
@@ -195,10 +188,16 @@ class VLMController:
                 top_p=0.9
             )
 
-            # Get response
+            # Trim generated IDs to get only the new tokens
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+
+            # Decode output
             output_text = self.processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=True
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
             )[0].strip()
 
             # Parse the output to extract action information
@@ -276,7 +275,7 @@ class VLMController:
     {trend_info}
     """
         
-        # Updated base instruction with balanced emphasis on safety, comfort, and efficiency
+        # Base instruction (same as original)
         base_instruction = """You are assisting an autonomous vehicle. Examine the frames and determine the best driving action.
 
     **GOAL**: Optimize driving behavior to maximize total reward by balancing safety, efficiency, and comfort.
@@ -321,22 +320,22 @@ class VLMController:
 
     6. **Reward-Based Decision Making**:
     - Watch for reward trends to adjust your strategy
-    - If safety reward is declining: Increase caution around potential pedestrians
+    - If safety reward is declining: Increase caution around multiple pedestrians
     - If progress reward is declining: Increase speed when no pedestrians are visible
     - If smoothness reward is declining: Make more gradual acceleration/deceleration changes
     - Remember that total reward is the ultimate measure of success
 
     Provide your response in the following format:
 
-    ACTION: [BRAKE_HARD/BRAKE_GENTLY/DECELERATE/MAINTAIN/ACCELERATE/ ACCELERATE_HARD]
+    ACTION: [DECELERATE/DO_NOTHING/ACCELERATE/]
     VALUE: [number between -1.0 and +1.0]
     JUSTIFICATION: [Brief explanation of your decision based on what you see in the frames and reward optimization]
 
     Make your decisions based solely on what you can see in the frames and the reward feedback.
-    """ 
+    """
         # Combine context and base instruction
         return f"{context_info}\n\n{base_instruction}"
-    
+
     def _parse_action_from_text(self, text):
         """
         Parse action information from the VLM output text.
@@ -354,9 +353,10 @@ class VLMController:
 
         try:
             # Extract action text
-            action_match = re.search(r'ACTION:\s*(BRAKE_HARD|BRAKE_GENTLY|DECELERATE|MAINTAIN|ACCELERATE)', text)
+            # Corrected line
+            action_match = re.search(r'ACTION:\s*(BRAKE_HARD|BRAKE_GENTLY|DECELERATE|MAINTAIN|ACCELERATE|ACCELERATE_HARD)', text, re.IGNORECASE)
             if action_match:
-                action_text = action_match.group(1)
+                action_text = action_match.group(1).upper()
 
             # Extract action value
             value_match = re.search(r'VALUE:\s*(-?\d+\.?\d*)', text)
@@ -370,8 +370,9 @@ class VLMController:
                     "BRAKE_HARD": -0.9,
                     "BRAKE_GENTLY": -0.5,
                     "DECELERATE": -0.2,
-                    "MAINTAIN": 0.3,
-                    "ACCELERATE": 0.7
+                    "MAINTAIN": 0.0,
+                    "ACCELERATE": 0.5,
+                    "ACCELERATE_HARD": 0.8
                 }
                 action_value = action_value_map.get(action_text, 0.0)
 
@@ -382,7 +383,6 @@ class VLMController:
 
             # If justification is too short, try to extract more context
             if len(justification) < 20:
-                # Try to extract a longer justification by taking everything after the JUSTIFICATION: label
                 full_text_after_justification = text.split("JUSTIFICATION:", 1)
                 if len(full_text_after_justification) > 1:
                     justification = full_text_after_justification[1].strip()
@@ -390,21 +390,25 @@ class VLMController:
         except Exception as e:
             print(f"Error parsing action from text: {e}")
             # If parsing fails, infer from text matching
-            if "brake hard" in text.lower() or "emergency" in text.lower():
+            text_lower = text.lower()
+            if "brake hard" in text_lower or "emergency" in text_lower:
                 action_text = "BRAKE_HARD"
                 action_value = -0.9
-            elif "brake" in text.lower() or "slow down" in text.lower():
+            elif "brake gently" in text_lower or "slow down" in text_lower:
                 action_text = "BRAKE_GENTLY"
                 action_value = -0.5
-            elif "deceler" in text.lower():
+            elif "decelerate" in text_lower:
                 action_text = "DECELERATE"
                 action_value = -0.2
-            elif "maintain" in text.lower() or "current speed" in text.lower():
+            elif "maintain" in text_lower or "current speed" in text_lower:
                 action_text = "MAINTAIN"
-                action_value = 0.3
-            elif "acceler" in text.lower() or "speed up" in text.lower():
+                action_value = 0.0
+            elif "accelerate hard" in text_lower:
+                action_text = "ACCELERATE_HARD"
+                action_value = 0.8
+            elif "accelerate" in text_lower or "speed up" in text_lower:
                 action_text = "ACCELERATE"
-                action_value = 0.7
+                action_value = 0.5
 
             justification = "Parsed from context due to format error"
 
@@ -426,7 +430,6 @@ class VLMController:
             # Create a sanitized version of vehicle_state
             sanitized_state = {}
             for key, value in vehicle_state.items():
-                # Convert non-serializable objects to strings
                 if isinstance(value, (int, float, str, bool)) or value is None:
                     sanitized_state[key] = value
                 else:
@@ -438,31 +441,28 @@ class VLMController:
                 "sequence_id": vlm_result.get("sequence_id", "unknown"),
                 "vehicle_state": sanitized_state,
                 "action_text": vlm_result.get("action_text", "UNKNOWN"),
-                "action_value": float(vlm_result.get("action_value", 0.0)),  # Ensure it's a float
+                "action_value": float(vlm_result.get("action_value", 0.0)),
                 "justification": str(vlm_result.get("justification", "")),
                 "raw_response": str(vlm_result.get("raw_text", ""))
             }
             
-            # Load existing log - handle potential file corruption
+            # Load existing log
             try:
                 with open(self.log_file, 'r') as f:
                     log_data = json.load(f)
             except (json.JSONDecodeError, FileNotFoundError):
-                # File is corrupted or doesn't exist, create a new log
                 log_data = {"initialization": time.time(), "decisions": []}
                 print(f"Created new log file due to corruption or missing file")
             
             # Add new decision
             log_data["decisions"].append(log_entry)
             
-            # Save updated log - using temporary file approach to avoid corruption
+            # Save updated log
             temp_file = f"{self.log_file}.temp"
             with open(temp_file, 'w') as f:
                 json.dump(log_data, f, indent=2)
             
-            # Replace original file with temp file
             os.replace(temp_file, self.log_file)
             
         except Exception as e:
             print(f"Error logging decision: {e}")
-            # Don't re-raise the exception, just log it
