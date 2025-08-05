@@ -1,113 +1,68 @@
+import warnings
 import os
-import time
-import numpy as np
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+import argparse
+from Models.CLIP import config
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.logger import configure
+from Models.CLIP.clip_rewarded_ppo import CLIPRewardedPPO
 from environment.carla_env import CarlaEnv
-from Models.vlm_controller import VLMController  # Make sure this matches your actual filename
-from utils.plot import plot_rewards
+from Models.CLIP.utils import HParamCallback, TensorboardCallback, write_json
 
-def main():
-    """Main function to run CARLA with VLM control."""
-    # Configuration
-    vlm_config = {
-        "model_name": "DAMO-NLP-SG/VideoLLaMA3-2B-Image",
-        "update_frequency": 2,  # Update more frequently
-        "frames_needed": 3,  # Use 3 frames for each decision
-        "output_dir": "./vlm_outputs",
-        "max_new_tokens": 512,
-        "verbose": True
-    }
-    
-    # Create output directory
-    os.makedirs(vlm_config["output_dir"], exist_ok=True)
-    
-    # Initialize environment with appropriate frame buffer size
-    env = CarlaEnv(vlm_frames=vlm_config["frames_needed"])
-    
-    # Initialize VLM controller and connect to environment
-    vlm_controller = VLMController(**vlm_config)
-    env.vlm_controller = vlm_controller  # This is crucial
-    
-    # Run episodes
-    num_episodes = 1
-    for episode in range(num_episodes):
-        print(f"\n{'=' * 50}")
-        print(f"Starting Episode {episode + 1}/{num_episodes}")
-        print(f"{'=' * 50}")
-        
-        # Reset environment
-        observation, info = env.reset()
-        done = False
-        episode_step = 0
-        episode_reward = 0
-        rewards_history = []  # Store all reward components for plotting
-        
-        # Initial logging
-        start_time = time.time()
-        metrics = {
-            "steps": 0,
-            "collision": False,
-            "success": False,
-            "stalled": False,
-            "pedestrian_detected_count": 0
-        }
-        
-        # Episode loop
-        while not done:
-            # Get VLM decision if enough frames are available
-            vlm_controller.process_if_needed(env)
-            
-            # Take step using VLM-determined action value directly
-            action_value = vlm_controller.current_action_value
-            observation, reward, terminated, truncated, info = env.step(action_value)
-            
-            # Capture reward components if available
-            if hasattr(env, 'current_reward_components'):
-                rewards_history.append(env.current_reward_components)
-            
-            done = terminated or truncated
-            episode_step += 1
-            episode_reward += reward
-            
-            # Track metrics
-            if info.get("pedestrian_detected", False):
-                metrics["pedestrian_detected_count"] += 1
-            
-            # Print progress every 20 steps
-            if episode_step % 20 == 0:
-                print(f"Step {episode_step}: Action={vlm_controller.current_action_text} ({action_value:.2f}), "
-                      f"Speed={info['speed_kmh']:.1f} km/h, "
-                      f"Ped. detected={info['pedestrian_detected']}")
-        
-        # Episode summary
-        duration = time.time() - start_time
-        metrics["steps"] = episode_step
-        
-        # Determine episode outcome
-        if len(env.collision_hist) > 0:
-            metrics["collision"] = True
-            outcome = "COLLISION"
-        elif env.successful_ep > metrics["success"]:
-            metrics["success"] = True
-            outcome = "SUCCESS"
-        else:
-            metrics["stalled"] = True
-            outcome = "STALLED"
-        
-        # Log episode results
-        print(f"\nEpisode {episode + 1} completed:")
-        print(f"  Outcome: {outcome}")
-        print(f"  Steps: {episode_step}")
-        print(f"  Duration: {duration:.1f} seconds")
-        print(f"  Reward: {episode_reward:.2f}")
-        print(f"  Pedestrian detections: {metrics['pedestrian_detected_count']}")
-        print(f"  Final action: {vlm_controller.current_action_text} ({vlm_controller.current_action_value:.2f})")
-        print(f"  Justification: {vlm_controller.current_justification}")
-        
-        # Plot rewards
-        reward_plot_path = os.path.join(vlm_config["output_dir"], f"episode_{episode+1}_rewards.png")
-        plot_rewards(rewards_history, reward_plot_path)
-    
-    print("\nAll episodes completed!")
+parser = argparse.ArgumentParser(description="Trains a CARLA agent with CLIPRewardedPPO")
+parser.add_argument("--host", default="localhost", type=str, help="IP of the host server (default: 127.0.0.1)")
+parser.add_argument("--port", default=2000, type=int, help="TCP port to listen to (default: 2000)")
+parser.add_argument("--total_timesteps", type=int, default=100_000, help="Total timesteps to train for")
+parser.add_argument("--start_carla", action="store_true", help="If True, start a CARLA server")
+parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
+parser.add_argument("--num_checkpoints", type=int, default=100, help="Checkpoint number")
+parser.add_argument("--log_dir", type=str, default="tensorboard", help="Directory to save logs")
+parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
+parser.add_argument("--config", type=str, default="carla_ppo", help="Config to use (default: carla_ppo)")
 
-if __name__ == "__main__":
-    main()
+args = vars(parser.parse_args())
+CONFIG = config.set_config(args["config"])
+CONFIG.algorithm_params.device = args["device"]
+
+os.makedirs(args["log_dir"], exist_ok=True)
+
+# Initialize environment
+env = DummyVecEnv([lambda: CarlaEnv(
+    render_mode=None if args["no_render"] else "human",
+    vlm_frames=3
+)])
+
+# Initialize model
+model = CLIPRewardedPPO(
+    env=env,
+    config=CONFIG,
+    inference_only=False
+)
+
+# Set up logging
+model_suffix = "{}_id{}".format(datetime.now().strftime("%Y%m%d_%H%M%S"), args['config'])
+model_name = f'{model.__class__.__name__}_{model_suffix}'
+model_dir = os.path.join(args["log_dir"], model_name)
+new_logger = configure(model_dir, ["stdout", "csv", "tensorboard"])
+model.set_logger(new_logger)
+write_json(CONFIG, os.path.join(model_dir, 'config.json'))
+
+# Train model
+model.learn(
+    total_timesteps=args["total_timesteps"],
+    callback=[
+        HParamCallback(CONFIG),
+        TensorboardCallback(1),
+        CheckpointCallback(
+            save_freq=args["total_timesteps"] // args["num_checkpoints"],
+            save_path=model_dir,
+            name_prefix="model"
+        )
+    ],
+    reset_num_timesteps=False
+)

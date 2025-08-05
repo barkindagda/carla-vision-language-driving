@@ -9,8 +9,6 @@ from gymnasium import spaces
 import carla
 import cv2
 from PIL import Image
-import torch
-import torchvision.transforms as T
 import xml.etree.ElementTree as ET
 
 from environment.global_route_planner import GlobalRoutePlanner
@@ -28,7 +26,6 @@ MOVING_OCC = False
 SPAWN_DELAY = 30
 MAX_TRAFFIC = 30
 
-
 class CarlaEnv(gym.Env):
     """An OpenAI gym wrapper for CARLA simulator with VLM control integration."""
 
@@ -43,9 +40,7 @@ class CarlaEnv(gym.Env):
         self.frame_buffer = []
         self.vlm_controller = None
         self.frame_save_dir = "/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/VLM_Action/vlm_outputs/frames/example4"
-        self.current_vlm_action = "MAINTAIN"
-        self.current_vlm_justification = "Starting the journey safely."
-
+ 
         # Create frame save directory if it doesn't exist
         os.makedirs(self.frame_save_dir, exist_ok=True)
 
@@ -261,30 +256,6 @@ class CarlaEnv(gym.Env):
             history_length = min(5, len(self.reward_history))
             recent_rewards = self.reward_history[-history_length:]
         
-        # Calculate simple trends if we have enough history
-        safety_trend = "N/A"
-        progress_trend = "N/A"
-        smoothness_trend = "N/A"
-        
-        if len(recent_rewards) >= 3:
-            # Get the average of the newest half vs oldest half of rewards
-            midpoint = len(recent_rewards) // 2
-            
-            # Safety trend (more negative is worse)
-            older_safety = sum([r.get('safety_reward', 0) for r in recent_rewards[:midpoint]]) / midpoint
-            newer_safety = sum([r.get('safety_reward', 0) for r in recent_rewards[midpoint:]]) / (len(recent_rewards) - midpoint)
-            safety_trend = "Improving" if newer_safety > older_safety else "Declining"
-            
-            # Progress trend (more positive is better)
-            older_progress = sum([r.get('progress_reward', 0) for r in recent_rewards[:midpoint]]) / midpoint
-            newer_progress = sum([r.get('progress_reward', 0) for r in recent_rewards[midpoint:]]) / (len(recent_rewards) - midpoint)
-            progress_trend = "Improving" if newer_progress > older_progress else "Declining"
-            
-            # Smoothness trend (closer to zero is better)
-            older_smoothness = sum([abs(r.get('smoothness_reward', 0)) for r in recent_rewards[:midpoint]]) / midpoint
-            newer_smoothness = sum([abs(r.get('smoothness_reward', 0)) for r in recent_rewards[midpoint:]]) / (len(recent_rewards) - midpoint)
-            smoothness_trend = "Improving" if newer_smoothness < older_smoothness else "Declining"
-        
         # Return structured state information with reward data
         return {
             # Basic vehicle state
@@ -302,20 +273,9 @@ class CarlaEnv(gym.Env):
             "distance_to_goal": dist_to_goal,
             "collision_detected": len(self.collision_hist) > 0,
             
-            # History and context
-            "timestep": self.timestep,
-            "previous_action": self.current_vlm_action,
-            "previous_justification": self.current_vlm_justification,
-            "occlusion_present": OCCLUSION,
-            
             # Reward information
             "current_rewards": reward_info,
             "recent_rewards": recent_rewards,
-            
-            # Trend analysis
-            "safety_trend": safety_trend,
-            "progress_trend": progress_trend,
-            "smoothness_trend": smoothness_trend
         }
 
     def filter_blueprints(self):
@@ -449,8 +409,7 @@ class CarlaEnv(gym.Env):
         # Clear frame buffer for VLM
         self.frame_buffer = []
         # Reset VLM action to default
-        self.current_vlm_action = "MAINTAIN"
-        self.current_vlm_justification = "Starting the journey safely."
+
         # Clean up existing sensors
         if self.camera_sensor is not None:
             if self.camera_sensor.is_listening():
@@ -576,7 +535,7 @@ class CarlaEnv(gym.Env):
         i3 = i2[:, :, :3]
         x = cv2.UMat(i3)
 
-        self.front_camera = x.get().transpose(2, 0, 1)  # grey(torch.from_numpy(x.get().transpose(2, 0, 1)))
+        self.front_camera = x.get().transpose(2, 0, 1)
 
         del i, i2, i3, x
 
@@ -604,15 +563,7 @@ class CarlaEnv(gym.Env):
         """
         # If action is None, use the current VLM action value
         if action is None:
-            # First check if we have a vlm_controller instance with a current_action_value
-            if hasattr(self, "vlm_controller") and hasattr(self.vlm_controller, "current_action_value"):
-                action = self.vlm_controller.current_action_value
-            # Then check if we have a direct current_action_value attribute
-            elif hasattr(self, "current_action_value"):
-                action = self.current_action_value
-            # Otherwise use a default safe value
-            else:
-                action = 0.0  # Default to neutral action if no VLM value is available
+            action = 0.0  # Default to neutral action if no VLM value is available
 
         # Update route if needed
         self.update_route()
@@ -723,50 +674,52 @@ class CarlaEnv(gym.Env):
             self.stall_ep += 1
             print("Episode terminated: Maximum timesteps reached")
 
-        # Calculate reward (keep for monitoring purposes)
+        # Calculate base reward (R_original)
         c1 = -(0.2 * ((speed ** 2) / max(0.1, veh2ped_dist) + 2) + 50 * int(veh2ped_dist < 1)) * int(det)
         c2 = 0.35 * speed * int(not (det))
         c3 = -(self.prev_s - speed) ** 2
-        reward = c1 + c2 + c3 + col
+        base_reward = c1 + c2 + c3 + col
 
-            # Store individual components (add these lines)
+        # Store individual components
         self.current_reward_components = {
-        "safety_reward": c1,
-        "progress_reward": c2,
-        "smoothness_reward": c3,
-        "collision_penalty": col,
-        "total_reward": reward}
+            "safety_reward": c1,
+            "progress_reward": c2,
+            "smoothness_reward": c3,
+            "collision_penalty": col,
+            "total_reward": base_reward  # R_original for now
+        }
 
         if not hasattr(self, 'reward_history'):
             self.reward_history = []
         self.reward_history.append(self.current_reward_components)
-    
 
         # Update metrics
         self.speeds.append(speed)
         self.accs.append(speed - self.prev_s)
         self.dets.append(det)
         self.dist.append(dist2cross)
-        self.rewards.append(reward)
+        self.rewards.append(base_reward)
 
         # Update timestep and previous speed
         self.timestep += 1
         self.prev_s = speed
 
-        # Prepare info dictionary with vehicle state
+        # Prepare info dictionary with vehicle state and data for CLIPRewardedPPO
         info = self.get_current_vehicle_state()
-        
-        # Add reward components to info dictionary
         info.update(self.current_reward_components)
 
-        # Add current VLM action details to info if available
-        if hasattr(self, "vlm_controller"):
-            info["vlm_action_text"] = self.vlm_controller.current_action_text
-            info["vlm_action_value"] = self.vlm_controller.current_action_value
-            info["vlm_justification"] = self.vlm_controller.current_justification
+        # Check if front_camera is valid before adding it to info
+        if self.front_camera is not None and self.front_camera.shape == (3, IM_HEIGHT, IM_WIDTH):
+            info["render_arrays"] = self.front_camera  # 3x384x384 RGB image
+        else:
+            print("Warning: Invalid front_camera data, skipping render_arrays")
+            info["render_arrays"] = np.zeros((3, IM_HEIGHT, IM_WIDTH), dtype=np.uint8)  # Provide a default empty array
 
-        # Return standard environment outputs
-        return (self.front_camera, reward, done, done, info)
+        info["base_rewards"] = base_reward  # R_original
+        info["speed_ms"] = speed  # For monitoring in CLIPRewardedPPO
+
+        # Return standard environment outputs (return base_reward, R_synthetic added in CLIPRewardedPPO)
+        return (self.front_camera, base_reward, done, done, info)
 
     def seed(self, seed=None):
         """
