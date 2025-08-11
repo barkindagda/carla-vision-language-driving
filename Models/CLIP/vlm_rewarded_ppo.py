@@ -6,8 +6,8 @@ from collections import deque
 from typing import Optional, Tuple, TypeVar, Type, Union, Dict, Any
 
 import numpy as np
-import open_clip
 from gymnasium import spaces
+import gymnasium as gym
 import torch
 import torch as th
 from box import Box
@@ -17,16 +17,16 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.save_util import recursive_setattr, load_from_zip_file
 from stable_baselines3.common.type_aliases import MaybeCallback, RolloutReturn
 from stable_baselines3.common.utils import safe_mean, check_for_correct_spaces, obs_as_tensor
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecEnv, DummyVecEnv
 from stable_baselines3.common.vec_env.patch_gym import _convert_space
 
-from Models.CLIP.clip_buffer import CLIPReplayBuffer, CLIPRolloutBuffer
-from Models.CLIP.clip_reward_model import compute_rewards, CLIPEmbed, CLIPReward
+from Models.vlm_controller import VLMScorer
+from Models.CLIP.rollout_buffer import VLMRolloutBuffer
 
-SelfCLIPRewardedPPO = TypeVar("SelfCLIPRewardedPPO", bound="CLIPRewardedPPO")
+SelfVLMRewardedPPO = TypeVar("SelfVLMRewardedPPO", bound="VLMRewardedPPO")
 
-class CLIPRewardedPPO(PPO):
-    rollout_buffer: CLIPReplayBuffer
+class VLMRewardedPPO(PPO):
+    rollout_buffer: VLMRolloutBuffer
 
     def __init__(
             self,
@@ -35,14 +35,22 @@ class CLIPRewardedPPO(PPO):
             config: Box,
             inference_only: bool = False,
     ):
+        """
+        PPO with VLM-based potential shaping for safety, comfort, and efficiency.
+        Args:
+            env: Vectorized environment.
+            config: Configuration with algorithm_params and vlm_params.
+            inference_only: If True, skip VLM loading for inference.
+        """
         self.config = config
-        self.clip_preprocess = None  # Initialize clip_preprocess
-        self.ep_clip_info_buffer = None  # type: Optional[deque]
+        self.vlm_scorer = None
+        self.ep_vlm_info_buffer = None  # type: Optional[deque]
 
         super().__init__(
             env=env,
             policy='MultiInputPolicy',
             seed=config.seed,
+            verbose=1,
             **self.config.algorithm_params,
         )
 
@@ -51,12 +59,9 @@ class CLIPRewardedPPO(PPO):
             self._setup_model()
             self._load_modules()
 
-    def _dump_logs(self) -> None:
-        pass
-
     def _setup_model(self):
         super()._setup_model()
-        self.rollout_buffer = CLIPRolloutBuffer(
+        self.rollout_buffer = VLMRolloutBuffer(
             self.n_steps,
             self.observation_space,
             self.action_space,
@@ -64,91 +69,49 @@ class CLIPRewardedPPO(PPO):
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
+            segment_length=self.config.vlm_params.get("segment_length", 8),
+            beta=self.config.vlm_params.get("beta", 0.2),
+            kappa=self.config.vlm_params.get("kappa", 0.5),
+            smooth_alpha=self.config.vlm_params.get("smooth_alpha", 0.8),
+            weights=self.config.vlm_params.get("weights", {"safety": 0.5, "comfort": 0.3, "efficiency": 0.2}),
         )
 
     def _load_modules(self):
-        model_name = self.config.clip_reward_params.pretrained_model
-        pretrained = "openai"  # Default pretrained checkpoint for OpenCLIP
-        clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
-            model_name, pretrained=pretrained
+        print("Loading VLMScorer...")
+        self.vlm_scorer = VLMScorer(
+            model_name=self.config.vlm_params.get("model_name", "DAMO-NLP-SG/VideoLLaMA3-2B-Image"),
+            device=self.config.vlm_params.get("device", "cuda"),
+            batch_size=self.config.vlm_params.get("batch_size", 32),
+            max_new_tokens=self.config.vlm_params.get("max_new_tokens", 512),
+            output_dir=self.config.vlm_params.get("output_dir", "./vlm_outputs"),
+            verbose=self.config.vlm_params.get("verbose", True),
         )
-        clip_model = clip_model.to(self.device)
-        clip_model = CLIPEmbed(clip_model)
-        target_prompts = open_clip.tokenize(self.config.clip_reward_params.target_prompts).to(self.device)
-        baseline_prompts = open_clip.tokenize(self.config.clip_reward_params.baseline_prompts).to(self.device)
-        self.reward_model = CLIPReward(
-            model=clip_model,
-            alpha=self.config.clip_reward_params.alpha,
-            target_prompts=target_prompts,
-            baseline_prompts=baseline_prompts,
-        ).eval().to(self.device)
 
-    def _compute_clip_rewards(self) -> None:
-        assert self.env is not None
-        assert self.ep_info_buffer is not None
-        ep_info_buffer_maxlen = self.ep_info_buffer.maxlen
-        assert ep_info_buffer_maxlen is not None
+    def _compute_vlm_potentials(self):
+        assert self.vlm_scorer is not None, "VLMScorer not initialized"
+        assert self.rollout_buffer is not None, "Rollout buffer not initialized"
 
-        frames = self.rollout_buffer.render_arrays  # List of [3, 384, 384]
-        if len(frames) == 0:
-            return
+        print(f"Computing VLM potentials for {self.rollout_buffer.pos} steps...")
+        print(f"Render arrays shape: {np.array(self.rollout_buffer.render_arrays).shape}")
+        self.rollout_buffer.compute_potentials_and_shaped_rewards(self.vlm_scorer)
 
-        # Validate frame shape
-        for arr in frames:
-            assert arr.shape[0] == 3 and len(arr.shape) == 3 and arr.shape[1:] == (384, 384), \
-                f"Expected frame shape [3, 384, 384], got {arr.shape}"
-
-        frames = torch.stack([
-            self.clip_preprocess(Image.fromarray(np.transpose(arr, (1, 2, 0)).astype(np.uint8)))
-            for arr in frames
-        ]).to(self.device)
-
-        r_synthetic = compute_rewards(
-            model=self.reward_model,
-            frames=frames,
-            batch_size=self.config.clip_reward_params.batch_size,
-        )
-        r_synthetic = r_synthetic.numpy().reshape(-1, 1)
-
-        thre_min, thre_max = 0.0, 1.0
-        r_synthetic = np.clip(r_synthetic, a_min=thre_min, a_max=thre_max)
-        r_synthetic = (r_synthetic - thre_min) / (thre_max - thre_min)
-
-        base_rewards = np.array(self.rollout_buffer.base_rewards).reshape(-1, 1)
-        assert base_rewards.shape[0] == r_synthetic.shape[0], \
-            f"Shape mismatch: base_rewards {base_rewards.shape}, r_synthetic {r_synthetic.shape}"
-
-        p = self.config.clip_reward_params.get('p', 0.1)
-        rewards = base_rewards + p * r_synthetic
-
-        # Update infos for training
-        for i, reward in enumerate(r_synthetic.flatten()):
-            idx = i  # Since we process all frames, idx aligns with step
-            if idx < len(self.rollout_buffer.infos):
-                if not isinstance(self.rollout_buffer.infos[idx], dict):
-                    self.rollout_buffer.infos[idx] = {}
-                self.rollout_buffer.infos[idx]['synthetic_reward'] = float(reward)
-                self.rollout_buffer.infos[idx]['total_reward'] = float(base_rewards[i] + p * reward)
-
-        print("R_synthetic ...")
-        print(list(np.round(r_synthetic.flatten(), 4)))
-        print("Base rewards (R_original) ...")
-        print(list(np.round(base_rewards.flatten(), 4)))
-        print("Final rewards (R_new) ...")
-        print(list(np.round(rewards.flatten(), 4)))
-
-        speeds = np.array(self.rollout_buffer.speeds)
-        print("Speeds (m/s) ...")
-        print(list(np.round(speeds.flatten(), 4)))
-
-        self.rollout_buffer.clear_render_arrays()
-        self.rollout_buffer.rewards = rewards
+        for i in range(self.rollout_buffer.pos):
+            info = self.rollout_buffer.infos[i]
+            if isinstance(info, dict):
+                info["potentials"] = {
+                    "safety": float(self.rollout_buffer.potentials[i, 0, 0]),
+                    "comfort": float(self.rollout_buffer.potentials[i, 0, 1]),
+                    "efficiency": float(self.rollout_buffer.potentials[i, 0, 2]),
+                }
+                info["base_reward"] = float(self.rollout_buffer.base_rewards[i, 0])
+                info["shaped_reward"] = float(self.rollout_buffer.rewards[i, 0])
+                print(f"Step {i}: potentials={info['potentials']}, base_reward={info['base_reward']:.4f}, shaped_reward={info['shaped_reward']:.4f}")
 
     def collect_rollouts(
             self,
             env: VecEnv,
             callback: BaseCallback,
-            rollout_buffer: CLIPRolloutBuffer,
+            rollout_buffer: VLMRolloutBuffer,
             n_rollout_steps: int,
     ) -> bool:
         assert self._last_obs is not None, "No previous observation was provided"
@@ -160,6 +123,7 @@ class CLIPRewardedPPO(PPO):
             self.policy.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
+        print("Starting rollout collection...")
 
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
@@ -177,52 +141,33 @@ class CLIPRewardedPPO(PPO):
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
             self.num_timesteps += env.num_envs
+            n_steps += 1
 
             # Validate infos and extract render_arrays, speeds
             assert isinstance(infos, list) and len(infos) == env.num_envs, \
                 f"Expected infos to be a list of length {env.num_envs}, got {type(infos)} with length {len(infos)}"
-            info = infos[0]  # Single environment
+            info = infos[0]
             assert isinstance(info, dict), f"Expected infos[0] to be a dict, got {type(info)}"
             render_arrays = info.get("render_arrays", new_obs)
-            assert isinstance(render_arrays, np.ndarray) and render_arrays.shape[0] == 3 and render_arrays.shape[1:] == (384, 384), \
+            # Handle CARLA frame shapes
+            if isinstance(render_arrays, torch.Tensor):
+                render_arrays = render_arrays.cpu().numpy()
+            if render_arrays.shape != (3, 384, 384):
+                if len(render_arrays.shape) == 3 and render_arrays.shape[-1] == 3:
+                    render_arrays = np.array(Image.fromarray(render_arrays).resize((384, 384))).transpose(2, 0, 1)
+                else:
+                    raise ValueError(f"Unexpected render_arrays shape: {render_arrays.shape}, expected [3, 384, 384] or [H, W, 3]")
+            assert isinstance(render_arrays, np.ndarray) and render_arrays.shape == (3, 384, 384), \
                 f"Expected render_arrays shape [3, 384, 384], got {render_arrays.shape}"
             speeds = info.get("speed_ms", 0.0)
 
-            # Compute synthetic reward for this step
-            if not self.inference_only:
-                frame = torch.stack([
-                    self.clip_preprocess(Image.fromarray(np.transpose(render_arrays, (1, 2, 0)).astype(np.uint8)))
-                ]).to(self.device)
-                r_synthetic = compute_rewards(
-                    model=self.reward_model,
-                    frames=frame,
-                    batch_size=1,
-                ).numpy().reshape(-1, 1)
-                r_synthetic = np.clip(r_synthetic, a_min=0.0, a_max=1.0)
-                r_synthetic = (r_synthetic - 0.0) / (1.0 - 0.0)
-                info["synthetic_reward"] = float(r_synthetic[0])
-                p = self.config.clip_reward_params.get('p', 0.1)
-                info["total_reward"] = float(rewards[0] + p * r_synthetic[0])
-                print(f"Step {self.num_timesteps}: synthetic_reward={info['synthetic_reward']:.4f}, total_reward={info['total_reward']:.4f}")  # Debug
+            print(f"Step {n_steps}: render_arrays shape={render_arrays.shape}, type={type(render_arrays)}")
 
-            callback.update_locals(locals())  # Moved after info update
+            callback.update_locals(locals())
             if callback.on_step() is False:
                 return False
 
             self._update_info_buffer(infos)
-            n_steps += 1
-
-            for idx, done in enumerate(dones):
-                if (
-                        done
-                        and infos[idx].get("terminal_observation") is not None
-                        and infos[idx].get("TimeLimit.truncated", False)
-                ):
-                    terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
-                    with th.no_grad():
-                        terminal_value = self.policy.predict_values(terminal_obs)[0]
-                    rewards[idx] += self.gamma * terminal_value
-
             rollout_buffer.add(
                 self._last_obs,
                 actions,
@@ -230,7 +175,7 @@ class CLIPRewardedPPO(PPO):
                 self._last_episode_starts,
                 values,
                 log_probs,
-                infos=[info],
+                infos=infos,
                 render_arrays=render_arrays,
                 speeds=speeds,
             )
@@ -241,11 +186,12 @@ class CLIPRewardedPPO(PPO):
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))
 
         if not self.inference_only:
-            self._compute_clip_rewards()
+            self._compute_vlm_potentials()
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         callback.on_rollout_end()
+        print("Rollout collection completed.")
 
         return True
 
@@ -253,7 +199,9 @@ class CLIPRewardedPPO(PPO):
         time_elapsed = max(
             (time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon
         )
+
         fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+
         self.logger.record("time/episodes", self._episode_num, exclude="tensorboard")
         if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
             self.logger.record(
@@ -297,29 +245,29 @@ class CLIPRewardedPPO(PPO):
             reset_num_timesteps,
             *args,
         )
-        if self.ep_clip_info_buffer is None or reset_num_timesteps:
-            self.ep_clip_info_buffer = deque(maxlen=100)
+        if self.ep_vlm_info_buffer is None or reset_num_timesteps:
+            self.ep_vlm_info_buffer = deque(maxlen=100)
         return total_timesteps, callback
 
-    def learn(self: SelfCLIPRewardedPPO, *args, **kwargs) -> SelfCLIPRewardedPPO:
+    def learn(self: SelfVLMRewardedPPO, *args, **kwargs) -> SelfVLMRewardedPPO:
         assert not self.inference_only
         return super().learn(*args, **kwargs)
 
     def save(self, *args, **kwargs) -> None:
-        super().save(*args, exclude=["reward_model", "worker_frames_tensor"], **kwargs)
+        super().save(*args, exclude=["vlm_scorer"], **kwargs)
 
     @classmethod
     def load(
-            cls: Type[SelfCLIPRewardedPPO],
+            cls: Type[SelfVLMRewardedPPO],
             path: Union[str, pathlib.Path],
             *,
             env: Optional[VecEnv] = None,
-            load_clip: bool = True,
+            load_vlm: bool = True,
             device: Union[torch.device, str] = "cuda:0",
             custom_objects: Optional[Dict[str, Any]] = None,
             force_reset: bool = True,
             **kwargs,
-    ) -> SelfCLIPRewardedPPO:
+    ) -> SelfVLMRewardedPPO:
         data, params, pytorch_variables = load_from_zip_file(
             path,
             device=device,
@@ -383,7 +331,7 @@ class CLIPRewardedPPO(PPO):
         model = cls(
             env=env,
             config=data["config"],
-            inference_only=not load_clip,
+            inference_only=not load_vlm,
         )
 
         model.__dict__.update(data)
@@ -414,6 +362,6 @@ class CLIPRewardedPPO(PPO):
         if model.use_sde:
             model.policy.reset_noise()
 
-        if load_clip:
+        if load_vlm:
             model._load_modules()
         return model
