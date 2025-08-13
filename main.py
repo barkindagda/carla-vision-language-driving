@@ -10,14 +10,14 @@ from Models.CLIP import config
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.logger import configure
-from Models.CLIP.clip_rewarded_ppo import CLIPRewardedPPO
+from Models.CLIP.vlm_rewarded_ppo import VLMRewardedPPO
 from environment.carla_env import CarlaEnv
 from Models.CLIP.utils import HParamCallback, TensorboardCallback, write_json
 
-parser = argparse.ArgumentParser(description="Trains a CARLA agent with CLIPRewardedPPO")
+parser = argparse.ArgumentParser(description="Trains a CARLA agent with VLMRewardedPPO")
 parser.add_argument("--host", default="localhost", type=str, help="IP of the host server (default: 127.0.0.1)")
 parser.add_argument("--port", default=2000, type=int, help="TCP port to listen to (default: 2000)")
-parser.add_argument("--total_timesteps", type=int, default=100_000, help="Total timesteps to train for")
+parser.add_argument("--total_timesteps", type=int, default=10_000, help="Total timesteps to train for")
 parser.add_argument("--start_carla", action="store_true", help="If True, start a CARLA server")
 parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
 parser.add_argument("--num_checkpoints", type=int, default=100, help="Checkpoint number")
@@ -29,16 +29,19 @@ args = vars(parser.parse_args())
 CONFIG = config.set_config(args["config"])
 CONFIG.algorithm_params.device = args["device"]
 
+# Ensure segment_length matches vlm_frames
+CONFIG.vlm_params.segment_length = 3  # Match CarlaEnv vlm_frames
+
 os.makedirs(args["log_dir"], exist_ok=True)
 
 # Initialize environment
 env = DummyVecEnv([lambda: CarlaEnv(
     render_mode=None if args["no_render"] else "human",
-    vlm_frames=3
+    vlm_frames=CONFIG.vlm_params.segment_length  # Align with segment_length
 )])
 
 # Initialize model
-model = CLIPRewardedPPO(
+model = VLMRewardedPPO(
     env=env,
     config=CONFIG,
     inference_only=False

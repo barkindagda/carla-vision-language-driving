@@ -112,7 +112,7 @@ reward_params = {
     ),
     "reward_clg": dict(
         pretrained_model="ViT-B-32",
-        batch_size=32,
+        batch_size=1,
         alpha=0.5,  # Added for CLIPReward
         target_prompts=["The vehicle is stopped, and the pedestrian is safely crossing the road."],
         baseline_prompts=["The vehicle is moving toward a pedestrian in close proximity there is a collision."],

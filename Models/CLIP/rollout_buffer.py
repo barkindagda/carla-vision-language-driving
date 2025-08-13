@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from gymnasium import spaces
 from stable_baselines3.common.buffers import RolloutBuffer
-
+from tqdm.auto import tqdm
 class VLMRolloutBuffer(RolloutBuffer):
     """
     Rollout buffer for potential-based shaping rewards using a VLM.
@@ -92,7 +92,11 @@ class VLMRolloutBuffer(RolloutBuffer):
                     })
                     segment_indices.append((seg_start, seg_end))
 
-                for batch_start in range(0, len(segments), vlm_scorer.batch_size):
+                # MODIFICATION: Add tqdm progress bar here
+                num_batches = (len(segments) + vlm_scorer.batch_size - 1) // vlm_scorer.batch_size
+                batch_iterator = range(0, len(segments), vlm_scorer.batch_size)
+                
+                for batch_start in tqdm(batch_iterator, total=num_batches, desc="VLM Scoring Segments"):
                     batch_segments = segments[batch_start:batch_start + vlm_scorer.batch_size]
                     if not batch_segments:
                         continue

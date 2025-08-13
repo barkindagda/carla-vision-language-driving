@@ -81,8 +81,8 @@ class VLMRewardedPPO(PPO):
         self.vlm_scorer = VLMScorer(
             model_name=self.config.vlm_params.get("model_name", "DAMO-NLP-SG/VideoLLaMA3-2B-Image"),
             device=self.config.vlm_params.get("device", "cuda"),
-            batch_size=self.config.vlm_params.get("batch_size", 32),
-            max_new_tokens=self.config.vlm_params.get("max_new_tokens", 512),
+            batch_size=self.config.vlm_params.get("batch_size", 1),
+            max_new_tokens=self.config.vlm_params.get("max_new_tokens", 312),
             output_dir=self.config.vlm_params.get("output_dir", "./vlm_outputs"),
             verbose=self.config.vlm_params.get("verbose", True),
         )
@@ -95,17 +95,17 @@ class VLMRewardedPPO(PPO):
         print(f"Render arrays shape: {np.array(self.rollout_buffer.render_arrays).shape}")
         self.rollout_buffer.compute_potentials_and_shaped_rewards(self.vlm_scorer)
 
-        for i in range(self.rollout_buffer.pos):
-            info = self.rollout_buffer.infos[i]
-            if isinstance(info, dict):
-                info["potentials"] = {
-                    "safety": float(self.rollout_buffer.potentials[i, 0, 0]),
-                    "comfort": float(self.rollout_buffer.potentials[i, 0, 1]),
-                    "efficiency": float(self.rollout_buffer.potentials[i, 0, 2]),
-                }
-                info["base_reward"] = float(self.rollout_buffer.base_rewards[i, 0])
-                info["shaped_reward"] = float(self.rollout_buffer.rewards[i, 0])
-                print(f"Step {i}: potentials={info['potentials']}, base_reward={info['base_reward']:.4f}, shaped_reward={info['shaped_reward']:.4f}")
+        # for i in range(self.rollout_buffer.pos):
+        #     info = self.rollout_buffer.infos[i]
+        #     if isinstance(info, dict):
+        #         info["potentials"] = {
+        #             "safety": float(self.rollout_buffer.potentials[i, 0, 0]),
+        #             "comfort": float(self.rollout_buffer.potentials[i, 0, 1]),
+        #             "efficiency": float(self.rollout_buffer.potentials[i, 0, 2]),
+        #         }
+        #         info["base_reward"] = float(self.rollout_buffer.base_rewards[i, 0])
+        #         info["shaped_reward"] = float(self.rollout_buffer.rewards[i, 0])
+        #         print(f"Step {i}: potentials={info['potentials']}, base_reward={info['base_reward']:.4f}, shaped_reward={info['shaped_reward']:.4f}")
 
     def collect_rollouts(
             self,
@@ -161,7 +161,7 @@ class VLMRewardedPPO(PPO):
                 f"Expected render_arrays shape [3, 384, 384], got {render_arrays.shape}"
             speeds = info.get("speed_ms", 0.0)
 
-            print(f"Step {n_steps}: render_arrays shape={render_arrays.shape}, type={type(render_arrays)}")
+            #print(f"Step {n_steps}: render_arrays shape={render_arrays.shape}, type={type(render_arrays)}")
 
             callback.update_locals(locals())
             if callback.on_step() is False:
