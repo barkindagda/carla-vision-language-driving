@@ -8,6 +8,7 @@ checkpoints/
 frames/
 logs/
 results/
+tensorboard/
 
 # Python-specific
 __pycache__/
