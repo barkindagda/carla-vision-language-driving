@@ -22,6 +22,8 @@ from stable_baselines3.common.vec_env.patch_gym import _convert_space
 
 from Models.vlm_controller import VLMScorer
 from Models.CLIP.rollout_buffer import VLMRolloutBuffer
+import open_clip
+from Models.CLIP.clip_reward_model import compute_rewards, CLIPEmbed, CLIPReward
 
 SelfVLMRewardedPPO = TypeVar("SelfVLMRewardedPPO", bound="VLMRewardedPPO")
 
@@ -36,14 +38,16 @@ class VLMRewardedPPO(PPO):
             inference_only: bool = False,
     ):
         """
-        PPO with VLM-based potential shaping for safety, comfort, and efficiency.
+        PPO with VLM-based potential shaping and CLIP-based synthetic rewards for safety, comfort, and efficiency.
         Args:
             env: Vectorized environment.
-            config: Configuration with algorithm_params and vlm_params.
-            inference_only: If True, skip VLM loading for inference.
+            config: Configuration with algorithm_params, vlm_params, and clip_reward_params.
+            inference_only: If True, skip VLM and CLIP loading for inference.
         """
         self.config = config
         self.vlm_scorer = None
+        self.clip_preprocess = None
+        self.reward_model = None
         self.ep_vlm_info_buffer = None  # type: Optional[deque]
 
         super().__init__(
@@ -87,6 +91,23 @@ class VLMRewardedPPO(PPO):
             verbose=self.config.vlm_params.get("verbose", True),
         )
 
+        print("Loading CLIP model...")
+        model_name = self.config.clip_reward_params.pretrained_model
+        pretrained = "openai"
+        clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained
+        )
+        clip_model = clip_model.to(self.device)
+        clip_model = CLIPEmbed(clip_model)
+        target_prompts = open_clip.tokenize(self.config.clip_reward_params.target_prompts).to(self.device)
+        baseline_prompts = open_clip.tokenize(self.config.clip_reward_params.baseline_prompts).to(self.device)
+        self.reward_model = CLIPReward(
+            model=clip_model,
+            alpha=self.config.clip_reward_params.alpha,
+            target_prompts=target_prompts,
+            baseline_prompts=baseline_prompts,
+        ).eval().to(self.device)
+
     def _compute_vlm_potentials(self):
         assert self.vlm_scorer is not None, "VLMScorer not initialized"
         assert self.rollout_buffer is not None, "Rollout buffer not initialized"
@@ -95,17 +116,70 @@ class VLMRewardedPPO(PPO):
         print(f"Render arrays shape: {np.array(self.rollout_buffer.render_arrays).shape}")
         self.rollout_buffer.compute_potentials_and_shaped_rewards(self.vlm_scorer)
 
-        # for i in range(self.rollout_buffer.pos):
-        #     info = self.rollout_buffer.infos[i]
-        #     if isinstance(info, dict):
-        #         info["potentials"] = {
-        #             "safety": float(self.rollout_buffer.potentials[i, 0, 0]),
-        #             "comfort": float(self.rollout_buffer.potentials[i, 0, 1]),
-        #             "efficiency": float(self.rollout_buffer.potentials[i, 0, 2]),
-        #         }
-        #         info["base_reward"] = float(self.rollout_buffer.base_rewards[i, 0])
-        #         info["shaped_reward"] = float(self.rollout_buffer.rewards[i, 0])
-        #         print(f"Step {i}: potentials={info['potentials']}, base_reward={info['base_reward']:.4f}, shaped_reward={info['shaped_reward']:.4f}")
+    def _compute_clip_rewards(self) -> None:
+        assert self.clip_preprocess is not None, "CLIP preprocess not initialized"
+        assert self.reward_model is not None, "CLIP reward model not initialized"
+
+        frames = self.rollout_buffer.render_arrays[:self.rollout_buffer.pos, 0]  # Use only filled buffer steps
+        if len(frames) == 0:
+            print("No frames available for CLIP reward computation.")
+            return
+
+        for arr in frames:
+            assert arr.shape == (3, 384, 384), f"Expected frame shape [3, 384, 384], got {arr.shape}"
+
+        frames = torch.stack([
+            self.clip_preprocess(Image.fromarray(np.transpose(arr, (1, 2, 0)).astype(np.uint8)))
+            for arr in frames
+        ]).to(self.device)
+
+        r_synthetic = compute_rewards(
+            model=self.reward_model,
+            frames=frames,
+            batch_size=self.config.clip_reward_params.batch_size,
+        )
+        r_synthetic = r_synthetic.numpy().reshape(-1, 1)
+
+        thre_min, thre_max = 0.0, 1.0
+        r_synthetic = np.clip(r_synthetic, a_min=thre_min, a_max=thre_max)
+        r_synthetic = (r_synthetic - thre_min) / (thre_max - thre_min)
+
+        base_rewards = np.array(self.rollout_buffer.base_rewards[:self.rollout_buffer.pos]).reshape(-1, 1)
+        shaping_terms = np.array(self.rollout_buffer.shaping_terms[:self.rollout_buffer.pos]).reshape(-1, 1)
+        assert base_rewards.shape[0] == r_synthetic.shape[0] == shaping_terms.shape[0], \
+            f"Shape mismatch: base_rewards {base_rewards.shape}, r_synthetic {r_synthetic.shape}, shaping_terms {shaping_terms.shape}"
+
+        updated_rewards = base_rewards + r_synthetic + shaping_terms
+
+        self.rollout_buffer.synthetic_rewards[:self.rollout_buffer.pos, 0] = r_synthetic.flatten()
+        for i, (base, synth, shape, total) in enumerate(zip(
+            base_rewards.flatten(), r_synthetic.flatten(), shaping_terms.flatten(), updated_rewards.flatten()
+        )):
+            if i < len(self.rollout_buffer.infos):
+                if not isinstance(self.rollout_buffer.infos[i], dict):
+                    self.rollout_buffer.infos[i] = {}
+                self.rollout_buffer.infos[i].update({
+                    'base_reward': float(base),
+                    'synthetic_reward': float(synth),
+                    'shaping_term': float(shape),
+                    'total_reward': float(total)
+                })
+
+        print("Base rewards ...")
+        print(list(np.round(base_rewards.flatten(), 4)))
+        print("Synthetic rewards ...")
+        print(list(np.round(r_synthetic.flatten(), 4)))
+        print("Shaping terms ...")
+        print(list(np.round(shaping_terms.flatten(), 4)))
+        print("Total rewards (base + synthetic + shaping) ...")
+        print(list(np.round(updated_rewards.flatten(), 4)))
+
+        speeds = np.array(self.rollout_buffer.speeds[:self.rollout_buffer.pos])
+        print("Speeds (m/s) ...")
+        print(list(np.round(speeds.flatten(), 4)))
+
+        self.rollout_buffer.rewards[:self.rollout_buffer.pos] = updated_rewards
+        self.rollout_buffer.clear_render_arrays()
 
     def collect_rollouts(
             self,
@@ -143,13 +217,14 @@ class VLMRewardedPPO(PPO):
             self.num_timesteps += env.num_envs
             n_steps += 1
 
-            # Validate infos and extract render_arrays, speeds
             assert isinstance(infos, list) and len(infos) == env.num_envs, \
                 f"Expected infos to be a list of length {env.num_envs}, got {type(infos)} with length {len(infos)}"
             info = infos[0]
             assert isinstance(info, dict), f"Expected infos[0] to be a dict, got {type(info)}"
-            render_arrays = info.get("render_arrays", new_obs)
-            # Handle CARLA frame shapes
+            render_arrays = info.get("render_arrays", None)
+            if render_arrays is None:
+                print("Warning: No render_arrays in infos, using default observation")
+                render_arrays = new_obs
             if isinstance(render_arrays, torch.Tensor):
                 render_arrays = render_arrays.cpu().numpy()
             if render_arrays.shape != (3, 384, 384):
@@ -160,8 +235,6 @@ class VLMRewardedPPO(PPO):
             assert isinstance(render_arrays, np.ndarray) and render_arrays.shape == (3, 384, 384), \
                 f"Expected render_arrays shape [3, 384, 384], got {render_arrays.shape}"
             speeds = info.get("speed_ms", 0.0)
-
-            #print(f"Step {n_steps}: render_arrays shape={render_arrays.shape}, type={type(render_arrays)}")
 
             callback.update_locals(locals())
             if callback.on_step() is False:
@@ -187,6 +260,7 @@ class VLMRewardedPPO(PPO):
 
         if not self.inference_only:
             self._compute_vlm_potentials()
+            self._compute_clip_rewards()
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
@@ -199,10 +273,9 @@ class VLMRewardedPPO(PPO):
         time_elapsed = max(
             (time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon
         )
-
         fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
 
-        self.logger.record("time/episodes", self._episode_num, exclude="tensorboard")
+        self.logger.record("time/episodes", self._episode_num)
         if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
             self.logger.record(
                 "rollout/ep_gt_rew_mean",
@@ -212,20 +285,27 @@ class VLMRewardedPPO(PPO):
                 "rollout/ep_len_mean",
                 safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]),
             )
+            base_rewards = [info.get('base_reward', 0) for info in self.ep_vlm_info_buffer if isinstance(info, dict)]
+            shaping_terms = [info.get('shaping_term', 0) for info in self.ep_vlm_info_buffer if isinstance(info, dict)]
+            synthetic_rewards = [info.get('synthetic_reward', 0) for info in self.ep_vlm_info_buffer if isinstance(info, dict)]
+            total_rewards = [info.get('total_reward', 0) for info in self.ep_vlm_info_buffer if isinstance(info, dict)]
+            if base_rewards:
+                self.logger.record("rollout/ep_mean_base_reward", safe_mean(base_rewards))
+            if shaping_terms:
+                self.logger.record("rollout/ep_mean_shaping_term", safe_mean(shaping_terms))
+            if synthetic_rewards:
+                self.logger.record("rollout/ep_mean_synthetic_reward", safe_mean(synthetic_rewards))
+            if total_rewards:
+                self.logger.record("rollout/ep_mean_total_reward", safe_mean(total_rewards))
+
         self.logger.record("time/fps", fps)
-        self.logger.record(
-            "time/time_elapsed", int(time_elapsed), exclude="tensorboard"
-        )
-        self.logger.record(
-            "time/total_timesteps", self.num_timesteps, exclude="tensorboard"
-        )
+        self.logger.record("time/time_elapsed", int(time_elapsed))
+        self.logger.record("time/total_timesteps", self.num_timesteps)
         if self.use_sde:
             self.logger.record("train/std", (self.actor.get_std()).mean().item())
 
         if len(self.ep_success_buffer) > 0:
-            self.logger.record(
-                "rollout/success_rate", safe_mean(self.ep_success_buffer)
-            )
+            self.logger.record("rollout/success_rate", safe_mean(self.ep_success_buffer))
         self.logger.dump(step=self.num_timesteps)
 
     def train(self) -> None:
@@ -254,7 +334,7 @@ class VLMRewardedPPO(PPO):
         return super().learn(*args, **kwargs)
 
     def save(self, *args, **kwargs) -> None:
-        super().save(*args, exclude=["vlm_scorer"], **kwargs)
+        super().save(*args, exclude=["vlm_scorer", "reward_model"], **kwargs)
 
     @classmethod
     def load(
@@ -263,6 +343,7 @@ class VLMRewardedPPO(PPO):
             *,
             env: Optional[VecEnv] = None,
             load_vlm: bool = True,
+            load_clip: bool = True,
             device: Union[torch.device, str] = "cuda:0",
             custom_objects: Optional[Dict[str, Any]] = None,
             force_reset: bool = True,
@@ -331,7 +412,7 @@ class VLMRewardedPPO(PPO):
         model = cls(
             env=env,
             config=data["config"],
-            inference_only=not load_vlm,
+            inference_only=not (load_vlm and load_clip),
         )
 
         model.__dict__.update(data)
@@ -362,6 +443,6 @@ class VLMRewardedPPO(PPO):
         if model.use_sde:
             model.policy.reset_noise()
 
-        if load_vlm:
+        if load_vlm and load_clip:
             model._load_modules()
         return model

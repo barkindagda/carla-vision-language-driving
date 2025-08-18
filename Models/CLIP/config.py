@@ -14,7 +14,6 @@ class CustomCNN(nn.Module):
     def __init__(self, input_shape, features_dim=1):
         super(CustomCNN, self).__init__()
         n_input_channels = input_shape[0]
-
         if n_input_channels == 3:
             self.cnn = nn.Sequential(
                 nn.Conv2d(n_input_channels, 16, kernel_size=5, stride=2),  # (16, 190, 190)
@@ -96,7 +95,7 @@ algorithm_params = {
         clip_range=0.2,
         ent_coef=0.05,
         n_epochs=10,
-        n_steps=1024,
+        n_steps=1024, #1024
         policy_kwargs=dict(
             activation_fn=th.nn.ReLU,
             net_arch=[dict(pi=[500, 300], vf=[500, 300])],

@@ -65,6 +65,8 @@ class HParamCallback(BaseCallback):
             "rollout/ep_len_mean": 0,
             "rollout/ep_rew_mean": 0,
             "train/value_loss": 0,
+            "train/policy_loss": 0,
+            "train/entropy_loss": 0,
         }
         self.logger.record("hparams", HParam(hparam_dict, metric_dict), exclude=("stdout", "log", "json", "csv"))
 
@@ -72,64 +74,46 @@ class HParamCallback(BaseCallback):
         return True
 
 class TensorboardCallback(BaseCallback):
+    """
+    Logs per-step custom metrics from the environment's info dictionary.
+    """
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.episode_rewards = []
-        self.episode_speeds = []
-        self.episode_count = 0
 
     def _on_step(self) -> bool:
         info = self.locals['infos'][0]
-        done = self.locals['dones'][0]
-        reward = self.locals['rewards'][0]
-        self.episode_rewards.append(reward)
-        if 'speed_ms' in info:
-            self.episode_speeds.append(info['speed_ms'])
+        for key in ['base_reward', 'synthetic_reward', 'shaping_term', 'total_reward']:
+            if key in info and isinstance(info[key], (int, float)):
+                self.logger.record(f"custom/{key}", info[key])
+        return True
 
-        # Log per-step metrics
-        if 'speed_ms' in info:
-            self.logger.record("custom/speed_ms", info['speed_ms'])
-        if 'reward' in info:
-            self.logger.record("custom/step_reward", info['reward'])
-        if 'safety_reward' in info:
-            self.logger.record("custom/safety_reward", info['safety_reward'])
-        if 'progress_reward' in info:
-            self.logger.record("custom/progress_reward", info['progress_reward'])
-        if 'smoothness_reward' in info:
-            self.logger.record("custom/smoothness_reward", info['smoothness_reward'])
-        if 'collision_penalty' in info:
-            self.logger.record("custom/collision_penalty", info['collision_penalty'])
-        # Log synthetic_reward, default to 0.0 if missing
-        self.logger.record("custom/synthetic_reward", info.get('synthetic_reward', 0.0))
-        if 'total_reward' in info:
-            self.logger.record("custom/total_reward", info['total_reward'])
-        if 'pedestrian_distance' in info:
-            self.logger.record("custom/pedestrian_distance", info['pedestrian_distance'])
-        if 'distance_to_goal' in info:
-            self.logger.record("custom/distance_to_goal", info['distance_to_goal'])
+class PostRolloutLogCallback(BaseCallback):
+    """
+    Logs the mean of reward components from the rollout buffer after a rollout.
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
 
-        # Log episode metrics when done
-        if done:
-            self.episode_count += 1
-            episode_length = len(self.episode_rewards)
-            total_reward = sum(self.episode_rewards)
-            mean_reward = total_reward / episode_length if episode_length > 0 else 0
-            avg_speed = np.mean(self.episode_speeds) if self.episode_speeds else 0
-            self.logger.record("custom/episode_count", self.episode_count)
-            self.logger.record("custom/total_reward", total_reward)
-            self.logger.record("custom/mean_reward", mean_reward)
-            self.logger.record("custom/episode_length", episode_length)
-            self.logger.record("custom/avg_speed", avg_speed)
-            self.logger.record("custom/collision_detected", 1 if info.get('collision_detected', False) else 0)
-            self.logger.record("custom/successful_ep", info.get('successful_ep', 0))
-            self.logger.record("custom/collision_ep", info.get('collision_ep', 0))
-            self.logger.record("custom/stall_ep", info.get('stall_ep', 0))
-            self.logger.record("custom/lane_ep", info.get('lane_ep', 0))
-            self.logger.record("time/num_timesteps", self.num_timesteps)
-            self.episode_rewards = []
-            self.episode_speeds = []
+    def _on_rollout_end(self) -> None:
+        rollout_buffer = self.model.rollout_buffer
+        if not hasattr(rollout_buffer, 'infos'):
+            return
 
-        self.logger.dump(self.num_timesteps)
+        base_rewards = [info.get('base_reward', 0) for info in rollout_buffer.infos if isinstance(info, dict)]
+        shaping_terms = [info.get('shaping_term', 0) for info in rollout_buffer.infos if isinstance(info, dict)]
+        synthetic_rewards = [info.get('synthetic_reward', 0) for info in rollout_buffer.infos if isinstance(info, dict)]
+        total_rewards = [info.get('total_reward', 0) for info in rollout_buffer.infos if isinstance(info, dict)]
+
+        if base_rewards:
+            self.logger.record("rollout/mean_base_reward", np.mean(base_rewards))
+        if shaping_terms:
+            self.logger.record("rollout/mean_shaping_term", np.mean(shaping_terms))
+        if synthetic_rewards:
+            self.logger.record("rollout/mean_synthetic_reward", np.mean(synthetic_rewards))
+        if total_rewards:
+            self.logger.record("rollout/mean_total_reward", np.mean(total_rewards))
+
+    def _on_step(self) -> bool:
         return True
 
 class VideoRecorderCallback(BaseCallback):
@@ -147,7 +131,7 @@ class VideoRecorderCallback(BaseCallback):
             return True
         display = self.training_env.unwrapped.envs[0].env.display
         frame = np.array(pygame.surfarray.array3d(display), dtype=np.uint8).transpose([1, 0, 2])
-        reward = self.locals['rewards'][0]
+        reward = self.locals['infos'][0].get('total_reward', self.locals['rewards'][0])
         self.video_recorder.add_frame_with_reward(frame, reward)
         return True
 

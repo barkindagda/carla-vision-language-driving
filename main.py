@@ -12,15 +12,16 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.logger import configure
 from Models.CLIP.vlm_rewarded_ppo import VLMRewardedPPO
 from environment.carla_env import CarlaEnv
-from Models.CLIP.utils import HParamCallback, TensorboardCallback, write_json
+# --- CHANGE 1: Import the new callback ---
+from Models.CLIP.utils import HParamCallback, TensorboardCallback, PostRolloutLogCallback, write_json
 
 parser = argparse.ArgumentParser(description="Trains a CARLA agent with VLMRewardedPPO")
 parser.add_argument("--host", default="localhost", type=str, help="IP of the host server (default: 127.0.0.1)")
 parser.add_argument("--port", default=2000, type=int, help="TCP port to listen to (default: 2000)")
-parser.add_argument("--total_timesteps", type=int, default=10_000, help="Total timesteps to train for")
+parser.add_argument("--total_timesteps", type=int, default=100_000, help="Total timesteps to train for")
 parser.add_argument("--start_carla", action="store_true", help="If True, start a CARLA server")
 parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
-parser.add_argument("--num_checkpoints", type=int, default=100, help="Checkpoint number")
+parser.add_argument("--num_checkpoints", type=int, default=1, help="Checkpoint number")
 parser.add_argument("--log_dir", type=str, default="tensorboard", help="Directory to save logs")
 parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
 parser.add_argument("--config", type=str, default="carla_ppo", help="Config to use (default: carla_ppo)")
@@ -60,9 +61,10 @@ model.learn(
     total_timesteps=args["total_timesteps"],
     callback=[
         HParamCallback(CONFIG),
-        TensorboardCallback(1),
+        TensorboardCallback(),
+        PostRolloutLogCallback(), # --- CHANGE 2: Add the PostRolloutLogCallback here ---
         CheckpointCallback(
-            save_freq=args["total_timesteps"] // args["num_checkpoints"],
+            save_freq=max(1, args["total_timesteps"] // args["num_checkpoints"]),
             save_path=model_dir,
             name_prefix="model"
         )
