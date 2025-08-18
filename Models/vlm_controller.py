@@ -28,10 +28,8 @@ class VLMScorer:
         self.max_new_tokens = max_new_tokens
         self.output_dir = output_dir
         self.verbose = verbose
-
         os.makedirs(output_dir, exist_ok=True)
         self.log_file = os.path.join(output_dir, f"vlm_scores_{int(time.time())}.jsonl")
-
         self._load_model()
 
     def _load_model(self):

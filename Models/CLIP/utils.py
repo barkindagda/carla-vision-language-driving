@@ -1,7 +1,7 @@
 import cv2
 import math
 import json
-import gym
+import gymnasium as gym
 import numpy as np
 import pygame
 from stable_baselines3.common.callbacks import BaseCallback
@@ -89,7 +89,7 @@ class TensorboardCallback(BaseCallback):
 
 class PostRolloutLogCallback(BaseCallback):
     """
-    Logs the mean of reward components from the rollout buffer after a rollout.
+    Logs the mean of reward components and episode statistics from the rollout buffer after a rollout.
     """
     def __init__(self, verbose=0):
         super().__init__(verbose)
@@ -112,6 +112,28 @@ class PostRolloutLogCallback(BaseCallback):
             self.logger.record("rollout/mean_synthetic_reward", np.mean(synthetic_rewards))
         if total_rewards:
             self.logger.record("rollout/mean_total_reward", np.mean(total_rewards))
+
+        # Log episode statistics
+        episode_starts = np.where(rollout_buffer.episode_starts[:, 0])[0]
+        episode_starts = np.concatenate([episode_starts, [rollout_buffer.pos]])
+        episode_rewards = []
+        episode_lengths = []
+        for i in range(len(episode_starts) - 1):
+            start, end = episode_starts[i], episode_starts[i + 1]
+            ep_reward = sum(rollout_buffer.infos[t].get('total_reward', 0) for t in range(start, end))
+            ep_length = end - start
+            episode_rewards.append(ep_reward)
+            episode_lengths.append(ep_length)
+        if rollout_buffer.pos > episode_starts[-1]:  # Handle partial episode
+            start = episode_starts[-1]
+            ep_reward = sum(rollout_buffer.infos[t].get('total_reward', 0) for t in range(start, rollout_buffer.pos))
+            ep_length = rollout_buffer.pos - start
+            episode_rewards.append(ep_reward)
+            episode_lengths.append(ep_length)
+        if episode_rewards:
+            self.logger.record("rollout/num_episodes", len(episode_rewards))
+            self.logger.record("rollout/ep_total_reward_mean", np.mean(episode_rewards))
+            self.logger.record("rollout/ep_len_mean", np.mean(episode_lengths))
 
     def _on_step(self) -> bool:
         return True

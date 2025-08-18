@@ -120,7 +120,7 @@ class VLMRewardedPPO(PPO):
         assert self.clip_preprocess is not None, "CLIP preprocess not initialized"
         assert self.reward_model is not None, "CLIP reward model not initialized"
 
-        frames = self.rollout_buffer.render_arrays[:self.rollout_buffer.pos, 0]  # Use only filled buffer steps
+        frames = self.rollout_buffer.render_arrays[:self.rollout_buffer.pos, 0]
         if len(frames) == 0:
             print("No frames available for CLIP reward computation.")
             return
@@ -199,6 +199,10 @@ class VLMRewardedPPO(PPO):
         callback.on_rollout_start()
         print("Starting rollout collection...")
 
+        current_episode_reward = 0.0
+        current_episode_length = 0
+        episode_starts = [0]
+
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 self.policy.reset_noise(env.num_envs)
@@ -236,6 +240,9 @@ class VLMRewardedPPO(PPO):
                 f"Expected render_arrays shape [3, 384, 384], got {render_arrays.shape}"
             speeds = info.get("speed_ms", 0.0)
 
+            current_episode_reward += rewards[0]
+            current_episode_length += 1
+
             callback.update_locals(locals())
             if callback.on_step() is False:
                 return False
@@ -255,12 +262,43 @@ class VLMRewardedPPO(PPO):
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
+            if dones[0]:
+                print(f"Episode terminated at step {n_steps}, base_reward: {current_episode_reward}, length: {current_episode_length}")
+                self.ep_info_buffer.append({
+                    "r": current_episode_reward,
+                    "l": current_episode_length
+                })
+                episode_starts.append(n_steps)
+                current_episode_reward = 0.0
+                current_episode_length = 0
+
         with th.no_grad():
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))
 
         if not self.inference_only:
             self._compute_vlm_potentials()
             self._compute_clip_rewards()
+            # Compute and log episode rewards and lengths after total_reward is calculated
+            episode_rewards = []
+            episode_lengths = []
+            for i in range(len(episode_starts) - 1):
+                start, end = episode_starts[i], episode_starts[i + 1]
+                ep_reward = sum(rollout_buffer.infos[t].get('total_reward', 0) for t in range(start, end))
+                ep_length = end - start
+                episode_rewards.append(ep_reward)
+                episode_lengths.append(ep_length)
+                print(f"Episode {i + 1}: total_reward={ep_reward:.4f}, length={ep_length}")
+            if current_episode_length > 0:  # Handle partial episode at end
+                start = episode_starts[-1]
+                ep_reward = sum(rollout_buffer.infos[t].get('total_reward', 0) for t in range(start, rollout_buffer.pos))
+                ep_length = rollout_buffer.pos - start
+                episode_rewards.append(ep_reward)
+                episode_lengths.append(ep_length)
+                print(f"Partial Episode {len(episode_starts)}: total_reward={ep_reward:.4f}, length={ep_length}")
+            if episode_rewards:
+                self.logger.record("rollout/num_episodes", len(episode_rewards))
+                self.logger.record("rollout/ep_total_reward_mean", np.mean(episode_rewards))
+                self.logger.record("rollout/ep_len_mean", np.mean(episode_lengths))
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
