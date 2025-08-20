@@ -18,7 +18,8 @@ class VLMController:
             frames_needed=3,
             output_dir="/home/cavlab/CARLA_0.9.15/VLM_Barkin/CarlaEnv/vlm_outputs",
             max_new_tokens=512,
-            verbose=True
+            verbose=True,
+            efficiency_priority=False  # New flag for instruction style
     ):
         """
         Initialize the VLM Controller.
@@ -37,6 +38,7 @@ class VLMController:
         self.max_new_tokens = max_new_tokens
         self.verbose = verbose
         self.last_update_timestep = 0 # Initialize here
+        self.efficiency_priority = efficiency_priority
 
         # Create timestamped output directory
         timestamp = int(time.time())
@@ -292,15 +294,15 @@ class VLMController:
         distance_to_goal = vehicle_state.get("distance_to_goal", 0)
         timestep = vehicle_state.get('timestep', 0)
 
-        # Remove pedestrian information as requested
         context_info = f"""Current vehicle state:
 - Speed: {speed_kmh:.1f} km/h
 - Acceleration: {acceleration:.2f} m/s²
 - Distance to goal: {distance_to_goal:.2f} meters
 - Timestep: {timestep}
 """
-
-        weights_instruction = """You are assisting in training a Proximal Policy Optimization (PPO) reinforcement learning agent for autonomous driving by determining appropriate reward weights.
+        
+        # Instruction 1: Default (safety-prioritized)
+        weights_instruction_safety = """You are assisting in training a Proximal Policy Optimization (PPO) reinforcement learning agent for autonomous driving by determining appropriate reward weights.
 
 **YOUR ROLE**: You analyze the current driving situation and determine the optimal reward weights that the PPO agent should use to learn good driving behavior.
 
@@ -318,12 +320,40 @@ class VLMController:
 - Analyze frames carefully
 
 Provide response in format:
-SAFETY_WEIGHT: [0.0-1]
+SAFETY_WEIGHT: [0-1]
 COMFORT_WEIGHT: [0.0-1]
 EFFICIENCY_WEIGHT: [0.0-1]
 JUSTIFICATION: [Explanation based on frames and context]
 """
-        return f"{context_info}\n\n{weights_instruction}"
+        # Instruction 2: Efficiency/comfort-prioritized (but still avoid collisions)
+        weights_instruction_efficiency = """You are assisting in training a Proximal Policy Optimization (PPO) reinforcement learning agent for autonomous driving by determining appropriate reward weights.
+
+**YOUR ROLE**: You analyze the current driving situation and determine the optimal reward weights that the PPO agent should use to learn good driving behavior.
+
+**TASK**: Based on the current driving situation shown in the frames, assign weights to three reward components:
+1. Safety weight (w1): Prioritize pedestrian safety, but only to the extent needed to avoid collisions
+2. Comfort weight (w2): Prioritize passenger comfort (smooth, pleasant driving)
+3. Efficiency weight (w3): Prioritize efficient and timely progress toward the goal
+
+**GUIDELINES**:
+- The weights will be used to calculate a composite reward signal that trains the PPO agent
+- Weights don't need to sum to 1.0 (they will be normalized)
+- Safety is important, but do not over-prioritize it unless there is a real risk of collision
+- In normal, safe situations, prioritize comfort and efficiency for a pleasant and timely ride
+- Only increase safety weight if there is a clear hazard or imminent risk
+- Analyze frames carefully
+
+Provide response in format:
+SAFETY_WEIGHT: [0-1]
+COMFORT_WEIGHT: [0.0-1]
+EFFICIENCY_WEIGHT: [0.0-1]
+JUSTIFICATION: [Explanation based on frames and context]
+"""
+        
+        if self.efficiency_priority:
+            return f"{context_info}\n\n{weights_instruction_efficiency}"
+        else:
+            return f"{context_info}\n\n{weights_instruction_safety}"
 
     def _parse_weights_from_text(self, text):
         """
@@ -333,9 +363,9 @@ JUSTIFICATION: [Explanation based on frames and context]
         Returns:
             dict: Parsed weight information
         """
-        safety_weight = 0.7
-        comfort_weight = 0.2
-        efficiency_weight = 0.1
+        safety_weight = 1
+        comfort_weight = 0.5
+        efficiency_weight = 0.5
         justification = "Default weight justification"
 
         try:
@@ -363,7 +393,7 @@ JUSTIFICATION: [Explanation based on frames and context]
                     efficiency_weight = float(match.group(1))
                     break
 
-            # Normalize weights before returning
+            #####Normalize weights before returning
             total = safety_weight + comfort_weight + efficiency_weight
             if total > 0:
                 safety_weight = safety_weight / total
@@ -383,11 +413,6 @@ JUSTIFICATION: [Explanation based on frames and context]
             # Limit justification length
             justification = justification[:500]  # Limit to 500 chars to avoid excessive logging
                     
-            # Round values to avoid floating point precision issues
-            safety_weight = round(safety_weight, 4)
-            comfort_weight = round(comfort_weight, 4)
-            efficiency_weight = round(efficiency_weight, 4)
-            
             if self.verbose:
                 print(f"Parsed weights: safety={safety_weight}, comfort={comfort_weight}, efficiency={efficiency_weight}")
                 
