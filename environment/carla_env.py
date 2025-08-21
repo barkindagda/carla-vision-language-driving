@@ -18,8 +18,8 @@ from environment.controller import PIDLateralController
 # Configuration constants
 IM_WIDTH = 384
 IM_HEIGHT = 384
-SPAWN_LOCATIONS = "/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/VLM_Action/environment/spawn_locations_v2.xml"
-ROUTES = "/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/VLM_Action/environment/routes.xml"
+SPAWN_LOCATIONS = "/home/server00/BARKIN/carla-vision-language-driving/environment/spawn_locations_v2.xml"
+ROUTES = "/home/server00/BARKIN/carla-vision-language-driving/environment/routes.xml"
 TRAFFIC = True
 OCCLUSION = True
 MOVING_OCC = False
@@ -37,12 +37,7 @@ class CarlaEnv(gym.Env):
 
         # VLM controller integration
         self.vlm_frames_needed = vlm_frames
-        self.frame_buffer = []
         self.vlm_controller = None
-        self.frame_save_dir = "/home/server01/Vinal/CARLA_0.9.15/VLM_Barkin/VLM_Action/vlm_outputs/frames/example4"
- 
-        # Create frame save directory if it doesn't exist
-        os.makedirs(self.frame_save_dir, exist_ok=True)
 
         # Connect to CARLA server
         print('Connecting to CARLA server...')
@@ -172,42 +167,6 @@ class CarlaEnv(gym.Env):
             float(1.0)
         )
 
-    def save_current_frame(self):
-        """
-        Save the current camera frame for VLM processing.
-        This captures the current view from the vehicle's camera and saves it
-        to disk for later analysis by the VLM.
-
-        Returns:
-            bool: True if we have enough frames for VLM processing
-        """
-        if self.front_camera is not None:
-            # Convert from CHW to HWC format for PIL
-            frame = self.front_camera.transpose(1, 2, 0)
-            img = Image.fromarray(frame.astype('uint8'))
-
-            # Create a unique timestamped filename
-            timestamp = int(time.time() * 1000000)
-            frame_path = os.path.join(self.frame_save_dir, f"frame_{timestamp}_{self.timestep}_opencv_detection.png")
-
-            try:
-                # Save the image to disk
-                img.save(frame_path)
-
-                # Add to frame buffer
-                self.frame_buffer.append(frame_path)
-                if len(self.frame_buffer) > self.vlm_frames_needed:
-                    # Remove oldest frame (but don't delete it from disk - useful for analysis)
-                    self.frame_buffer.pop(0)
-
-                return True
-            except Exception as e:
-                print(f"Error saving frame: {e}")
-                return False
-
-        # Return True if we have enough frames for VLM processing
-        return len(self.frame_buffer) >= self.vlm_frames_needed
-
     def get_current_vehicle_state(self):
         """
         Get relevant vehicle state information for the VLM.
@@ -242,7 +201,7 @@ class CarlaEnv(gym.Env):
 
         # Enhanced pedestrian detection with increased range
         pedestrian_detected = veh2ped_dist < 12.0 and \
-                            (self.get_distance_to_goal(self.ped, self.ped_target) > 2)
+                              (self.get_distance_to_goal(self.ped, self.ped_target) > 2)
 
         # Get reward components if available
         reward_info = {}
@@ -406,9 +365,6 @@ class CarlaEnv(gym.Env):
         self.timestep = 0
         self.ped_count = 0
         self.stopped = False
-        # Clear frame buffer for VLM
-        self.frame_buffer = []
-        # Reset VLM action to default
 
         # Clean up existing sensors
         if self.camera_sensor is not None:
@@ -500,9 +456,6 @@ class CarlaEnv(gym.Env):
                 # Ensure we have at least one camera frame
                 if not self.image_queue.empty():
                     self.process_img(self.image_queue.get())
-
-                    # Save the initial frame for VLM
-                    self.save_current_frame()
                 else:
                     print("Warning: No initial camera frame available")
             except Exception as e:
@@ -553,17 +506,16 @@ class CarlaEnv(gym.Env):
 
     def step(self, action=None):
         """
-        Take a step in the environment using either the provided action or the VLM's recommendation.
+        Take a step in the environment.
 
         Args:
-            action: Numeric action value between -1.0 and 1.0, or None to use VLM action
+            action: Numeric action value between -1.0 and 1.0
 
         Returns:
             Tuple of (observation, reward, terminated, truncated, info)
         """
-        # If action is None, use the current VLM action value
         if action is None:
-            action = 0.0  # Default to neutral action if no VLM value is available
+            action = 0.0
 
         # Update route if needed
         self.update_route()
@@ -578,14 +530,12 @@ class CarlaEnv(gym.Env):
 
         # Apply the action to control the vehicle
         if action < 0:
-            # Braking (negative action)
             self.vehicle.apply_control(carla.VehicleControl(
                 throttle=0.0,
                 brake=float(abs(action)),
                 steer=self.controller.run_step(self.route[self.route_ind][0])
             ))
         else:
-            # Acceleration/maintaining (positive action)
             self.vehicle.apply_control(carla.VehicleControl(
                 throttle=float(action),
                 brake=0.0,
@@ -604,7 +554,6 @@ class CarlaEnv(gym.Env):
         ped_dist = self.get_distance_to_goal(self.ped, self.ped_target)
 
         # Control pedestrian movement
-        # Set pedestrian bounds
         if OCCLUSION:
             ped_lb = 1
             ped_hb = 2
@@ -613,7 +562,6 @@ class CarlaEnv(gym.Env):
             ped_hb = 8
 
         if MOVING_OCC:
-            # Pedestrian crosses in front of ego vehicle
             if ((self.ped.get_location().y - self.vehicle.get_location().y) < 13) and (ped_dist > 0):
                 if (3 < ped_dist < 4) and self.ped_count < 40:
                     self.ped_count += 1
@@ -621,7 +569,6 @@ class CarlaEnv(gym.Env):
                 else:
                     self.ped.apply_control(carla.WalkerControl(carla.Vector3D(1, 0, 0), speed=4, jump=False))
             else:
-                # Pedestrian crosses in front of van
                 if ((self.ped.get_location().y - self.obsticle.get_location().y) < 15.5) and (ped_dist > 0):
                     if (7 < ped_dist < 8):
                         self.ped.apply_control(carla.WalkerControl(carla.Vector3D(0, 0, 0), speed=0, jump=False))
@@ -649,9 +596,6 @@ class CarlaEnv(gym.Env):
                 print("Warning: Image queue is empty")
         except Exception as e:
             print(f"Failed to process image: {e}")
-
-        # Save frame for VLM processing
-        self.save_current_frame()
 
         # Simple pedestrian detection (using distance)
         det = 1 if veh2ped_dist < 7.5 and (ped_dist > 2) else 0
@@ -686,7 +630,7 @@ class CarlaEnv(gym.Env):
             "progress_reward": c2,
             "smoothness_reward": c3,
             "collision_penalty": col,
-            "total_reward": base_reward  # R_original for now
+            "total_reward": base_reward
         }
 
         if not hasattr(self, 'reward_history'):
@@ -704,78 +648,49 @@ class CarlaEnv(gym.Env):
         self.timestep += 1
         self.prev_s = speed
 
-        # Prepare info dictionary with vehicle state and data for CLIPRewardedPPO
+        # Prepare info dictionary
         info = self.get_current_vehicle_state()
         info.update(self.current_reward_components)
 
-        # Check if front_camera is valid before adding it to info
         if self.front_camera is not None and self.front_camera.shape == (3, IM_HEIGHT, IM_WIDTH):
-            info["render_arrays"] = self.front_camera  # 3x384x384 RGB image
+            info["render_arrays"] = self.front_camera
         else:
             print("Warning: Invalid front_camera data, skipping render_arrays")
-            info["render_arrays"] = np.zeros((3, IM_HEIGHT, IM_WIDTH), dtype=np.uint8)  # Provide a default empty array
+            info["render_arrays"] = np.zeros((3, IM_HEIGHT, IM_WIDTH), dtype=np.uint8)
 
-        info["base_rewards"] = base_reward  # R_original
-        info["speed_ms"] = speed  # For monitoring in CLIPRewardedPPO
+        info["base_rewards"] = base_reward
+        info["speed_ms"] = speed
 
-        # Return standard environment outputs (return base_reward, R_synthetic added in CLIPRewardedPPO)
         return (self.front_camera, base_reward, done, done, info)
 
     def seed(self, seed=None):
-        """
-        Set the seed for this environment's random number generators.
-
-        Args:
-            seed (int, optional): The seed to use. If None, a random seed will be used.
-
-        Returns:
-            list: The seed(s) used by the environment
-        """
-        # Generate a numpy random generator
+        """Set the seed for this environment's random number generators."""
         self.np_random, seed = gym.utils.seeding.np_random(seed)
-
-        # Set random seeds for additional randomness sources
         random.seed(seed)
         np.random.seed(seed)
-
-        # Set seed for traffic manager if it exists
         if hasattr(self, 'traffic_manager'):
             self.traffic_manager.set_random_device_seed(seed)
-
-        # Return the seed as a list for compatibility
         return [seed]
 
     def render(self, mode):
         pass
 
     def _set_synchronous_mode(self, synchronous=True):
-        """Set whether to use the synchronous mode.
-        """
+        """Set whether to use the synchronous mode."""
         self.settings.synchronous_mode = synchronous
         self.world.apply_settings(self.settings)
 
     def _clear_all_actors(self, actor_filters):
-        """
-        Clear specific actors from the CARLA world.
-
-        Args:
-            actor_filters (list): List of actor filter strings (e.g., 'vehicle.*', 'walker.*')
-        """
+        """Clear specific actors from the CARLA world."""
         for actor_filter in actor_filters:
             try:
-                # Get all actors matching the filter
                 matching_actors = self.world.get_actors().filter(actor_filter)
-
-                # First stop any walker controllers (they need to be stopped before destruction)
                 if actor_filter == 'controller.ai.walker':
                     for actor in matching_actors:
                         if actor.is_alive:
                             actor.stop()
-
-                # Then destroy all actors of this type
                 for actor in matching_actors:
                     if actor.is_alive:
                         actor.destroy()
-
             except Exception as e:
                 print(f"Error while clearing actors with filter '{actor_filter}': {e}")

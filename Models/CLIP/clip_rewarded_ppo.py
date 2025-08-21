@@ -22,8 +22,10 @@ from stable_baselines3.common.vec_env.patch_gym import _convert_space
 
 from Models.CLIP.clip_buffer import CLIPReplayBuffer, CLIPRolloutBuffer
 from Models.CLIP.clip_reward_model import compute_rewards, CLIPEmbed, CLIPReward
+from Models.vlm_weights import VLMScorer  # Import the new VLMScorer class
 
 SelfCLIPRewardedPPO = TypeVar("SelfCLIPRewardedPPO", bound="CLIPRewardedPPO")
+
 
 class CLIPRewardedPPO(PPO):
     rollout_buffer: CLIPReplayBuffer
@@ -38,6 +40,7 @@ class CLIPRewardedPPO(PPO):
         self.config = config
         self.clip_preprocess = None  # Initialize clip_preprocess
         self.ep_clip_info_buffer = None  # type: Optional[deque]
+        self.vlm_scorer = None # Initialize vlm_scorer
 
         super().__init__(
             env=env,
@@ -67,6 +70,7 @@ class CLIPRewardedPPO(PPO):
         )
 
     def _load_modules(self):
+        # This part for the CLIP reward model remains the same
         model_name = self.config.clip_reward_params.pretrained_model
         pretrained = "openai"  # Default pretrained checkpoint for OpenCLIP
         clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
@@ -83,66 +87,73 @@ class CLIPRewardedPPO(PPO):
             baseline_prompts=baseline_prompts,
         ).eval().to(self.device)
 
+        # ADD THIS PART to load your VLM scorer
+        print("Initializing VLM Scorer...")
+        self.vlm_scorer = VLMScorer(device=self.device)
+        print("VLM Scorer initialized successfully.")
+
     def _compute_clip_rewards(self) -> None:
         assert self.env is not None
-        assert self.ep_info_buffer is not None
-        ep_info_buffer_maxlen = self.ep_info_buffer.maxlen
-        assert ep_info_buffer_maxlen is not None
 
-        frames = self.rollout_buffer.render_arrays  # List of [3, 384, 384]
-        if len(frames) == 0:
+        # --- 1. GATHER DATA FROM THE ROLLOUT BUFFER ---
+        frames_raw = self.rollout_buffer.render_arrays
+        if len(frames_raw) == 0:
             return
 
-        # Validate frame shape
-        for arr in frames:
-            assert arr.shape[0] == 3 and len(arr.shape) == 3 and arr.shape[1:] == (384, 384), \
-                f"Expected frame shape [3, 384, 384], got {arr.shape}"
+        speeds_raw = self.rollout_buffer.speeds
+        infos_raw = self.rollout_buffer.infos
 
-        frames = torch.stack([
+        # --- 2. CALCULATE SYNTHETIC REWARD (R_synthetic) ---
+        frames_processed_clip = torch.stack([
             self.clip_preprocess(Image.fromarray(np.transpose(arr, (1, 2, 0)).astype(np.uint8)))
-            for arr in frames
+            for arr in frames_raw
         ]).to(self.device)
 
         r_synthetic = compute_rewards(
             model=self.reward_model,
-            frames=frames,
+            frames=frames_processed_clip,
             batch_size=self.config.clip_reward_params.batch_size,
         )
         r_synthetic = r_synthetic.numpy().reshape(-1, 1)
+        r_synthetic = np.clip(r_synthetic, 0.0, 1.0)  # Normalize
 
-        thre_min, thre_max = 0.0, 1.0
-        r_synthetic = np.clip(r_synthetic, a_min=thre_min, a_max=thre_max)
-        r_synthetic = (r_synthetic - thre_min) / (thre_max - thre_min)
+        # --- 3. GET VLM WEIGHTS (w1, w2, w3) USING YOUR VLMScorer ---
+        # Your scorer processes the entire rollout as a single segment.
+        # We must shape the data into a batch of size 1.
+        frames_batch = frames_raw[np.newaxis, ...]
+        speeds_batch = speeds_raw.T[np.newaxis, ...]
+        infos_batch = [infos_raw]  # List of lists
 
-        base_rewards = np.array(self.rollout_buffer.base_rewards).reshape(-1, 1)
-        assert base_rewards.shape[0] == r_synthetic.shape[0], \
-            f"Shape mismatch: base_rewards {base_rewards.shape}, r_synthetic {r_synthetic.shape}"
+        # Call your VLM scorer
+        vlm_scores = self.vlm_scorer.score_segment_batch(frames_batch, speeds_batch, infos_batch)
+        
+        # The scorer returns one set of weights for the whole segment.
+        # We will apply these same weights to every step in the rollout.
+        w1, w2, w3 = vlm_scores[0]  # e.g., [0.9, 0.8, 0.7]
 
+        # --- 4. EXTRACT RAW REWARD COMPONENTS FROM BUFFER ---
+        c1_batch = np.array([info[0].get("safety_reward", 0) for info in infos_raw]).reshape(-1, 1)
+        c2_batch = np.array([info[0].get("progress_reward", 0) for info in infos_raw]).reshape(-1, 1)
+        c3_batch = np.array([info[0].get("smoothness_reward", 0) for info in infos_raw]).reshape(-1, 1)
+        col_batch = np.array([info[0].get("collision_penalty", 0) for info in infos_raw]).reshape(-1, 1)
+
+        # --- 5. CALCULATE THE FINAL REWARD ---
+        # Apply the single set of VLM weights to all timesteps
+        weighted_base_rewards = (w1 * c1_batch) + (w2 * c2_batch) + (w3 * c3_batch) + col_batch
+        
         p = self.config.clip_reward_params.get('p', 0.1)
-        rewards = base_rewards + p * r_synthetic
-
-        # Update infos for training
-        for i, reward in enumerate(r_synthetic.flatten()):
-            idx = i  # Since we process all frames, idx aligns with step
-            if idx < len(self.rollout_buffer.infos):
-                if not isinstance(self.rollout_buffer.infos[idx], dict):
-                    self.rollout_buffer.infos[idx] = {}
-                self.rollout_buffer.infos[idx]['synthetic_reward'] = float(reward)
-                self.rollout_buffer.infos[idx]['total_reward'] = float(base_rewards[i] + p * reward)
-
-        print("R_synthetic ...")
-        print(list(np.round(r_synthetic.flatten(), 4)))
-        print("Base rewards (R_original) ...")
-        print(list(np.round(base_rewards.flatten(), 4)))
-        print("Final rewards (R_new) ...")
-        print(list(np.round(rewards.flatten(), 4)))
-
-        speeds = np.array(self.rollout_buffer.speeds)
-        print("Speeds (m/s) ...")
-        print(list(np.round(speeds.flatten(), 4)))
-
+        final_rewards = weighted_base_rewards + p * r_synthetic
+        
+        # --- 6. UPDATE BUFFER AND LOGGING ---
+        print("--- Reward Calculation Summary ---")
+        print(f"VLM Scores: Safety(w1)={w1:.2f}, Comfort(w2)={w2:.2f}, Efficiency(w3)={w3:.2f}")
+        print("Weighted Base Rewards (first 5):", list(np.round(weighted_base_rewards.flatten()[:5], 4)))
+        print("Synthetic Rewards (first 5):  ", list(np.round(r_synthetic.flatten()[:5], 4)))
+        print("Final Rewards (first 5):      ", list(np.round(final_rewards.flatten()[:5], 4)))
+        
         self.rollout_buffer.clear_render_arrays()
-        self.rollout_buffer.rewards = rewards
+        self.rollout_buffer.rewards = final_rewards
+
 
     def collect_rollouts(
             self,
@@ -178,7 +189,6 @@ class CLIPRewardedPPO(PPO):
 
             self.num_timesteps += env.num_envs
 
-            # Validate infos and extract render_arrays, speeds
             assert isinstance(infos, list) and len(infos) == env.num_envs, \
                 f"Expected infos to be a list of length {env.num_envs}, got {type(infos)} with length {len(infos)}"
             info = infos[0]  # Single environment
@@ -188,24 +198,23 @@ class CLIPRewardedPPO(PPO):
                 f"Expected render_arrays shape [3, 384, 384], got {render_arrays.shape}"
             speeds = info.get("speed_ms", 0.0)
 
-            # Compute synthetic reward for this step
+            # This per-step synthetic reward calculation is now only for immediate logging/debugging
             if not self.inference_only:
                 frame = torch.stack([
                     self.clip_preprocess(Image.fromarray(np.transpose(render_arrays, (1, 2, 0)).astype(np.uint8)))
                 ]).to(self.device)
-                r_synthetic = compute_rewards(
+                r_synthetic_step = compute_rewards(
                     model=self.reward_model,
                     frames=frame,
                     batch_size=1,
                 ).numpy().reshape(-1, 1)
-                r_synthetic = np.clip(r_synthetic, a_min=0.0, a_max=1.0)
-                r_synthetic = (r_synthetic - 0.0) / (1.0 - 0.0)
-                info["synthetic_reward"] = float(r_synthetic[0])
+                r_synthetic_step = np.clip(r_synthetic_step, a_min=0.0, a_max=1.0)
+                info["synthetic_reward_step"] = float(r_synthetic_step[0])
                 p = self.config.clip_reward_params.get('p', 0.1)
-                info["total_reward"] = float(rewards[0] + p * r_synthetic[0])
-                print(f"Step {self.num_timesteps}: synthetic_reward={info['synthetic_reward']:.4f}, total_reward={info['total_reward']:.4f}")  # Debug
+                info["total_reward_estimate"] = float(rewards[0] + p * r_synthetic_step[0])
+                # print(f"Step {self.num_timesteps}: synthetic_reward_step={info['synthetic_reward_step']:.4f}, total_reward_estimate={info['total_reward_estimate']:.4f}") # Optional: uncomment for verbose step-by-step logging
 
-            callback.update_locals(locals())  # Moved after info update
+            callback.update_locals(locals())
             if callback.on_step() is False:
                 return False
 
@@ -230,7 +239,7 @@ class CLIPRewardedPPO(PPO):
                 self._last_episode_starts,
                 values,
                 log_probs,
-                infos=[info],
+                infos=infos, # Store the list of infos
                 render_arrays=render_arrays,
                 speeds=speeds,
             )
@@ -306,7 +315,7 @@ class CLIPRewardedPPO(PPO):
         return super().learn(*args, **kwargs)
 
     def save(self, *args, **kwargs) -> None:
-        super().save(*args, exclude=["reward_model", "worker_frames_tensor"], **kwargs)
+        super().save(*args, exclude=["reward_model", "vlm_scorer", "worker_frames_tensor"], **kwargs)
 
     @classmethod
     def load(

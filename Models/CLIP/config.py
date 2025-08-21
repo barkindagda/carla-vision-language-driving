@@ -87,6 +87,17 @@ class CustomMultiInputExtractor(BaseFeaturesExtractor):
             encoded_tensor_list.append(self.extractors["default"](observations))
         return torch.cat(encoded_tensor_list, dim=1)
 
+# --- NEW: Add parameters for the VLM Scorer ---
+vlm_params = {
+    "vlm_carla": dict(
+        model_name="DAMO-NLP-SG/VideoLLaMA3-2B-Image",
+        batch_size=8,
+        max_new_tokens=32,
+        clip_size=3,  # Number of frames per short clip
+        step_size=1,  # Step size for the rolling clip window
+    ),
+}
+
 algorithm_params = {
     "PPO": dict(
         device="cuda:0",
@@ -108,12 +119,12 @@ algorithm_params = {
 
 reward_params = {
     "reward_carla": dict(
-        target_speed=20.0,  # km/h, matches CarlaEnv speed limit
+        target_speed=20.0,
     ),
     "reward_clg": dict(
         pretrained_model="ViT-B-32",
-        batch_size=32,
-        alpha=0.5,  # Added for CLIPReward
+        batch_size=1,
+        alpha=0.5,
         target_prompts=["The vehicle is stopped, and the pedestrian is safely crossing the road."],
         baseline_prompts=["The vehicle is moving toward a pedestrian in close proximity there is a collision."],
         p=0.1,  # Weight for R_synthetic
@@ -127,6 +138,7 @@ _CONFIG_carla_ppo = {
     "reward_fn": "reward_carla",
     "reward_params": reward_params["reward_carla"],
     "clip_reward_params": reward_params["reward_clg"],
+    "vlm_params": vlm_params["vlm_carla"], # --- NEW: Add the VLM parameters to the config ---
     "vlm_reward_type": "VLM-RL",
     "obs_res": (384, 384),
     "seed": 100,
