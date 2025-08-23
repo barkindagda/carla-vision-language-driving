@@ -1,7 +1,7 @@
 import cv2
 import math
 import json
-import gym
+import gymnasium as gym
 import numpy as np
 import pygame
 from stable_baselines3.common.callbacks import BaseCallback
@@ -26,9 +26,6 @@ class VideoRecorder:
     def __init__(self, filename, frame_size, fps=30):
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
         self.video_writer = cv2.VideoWriter(filename, fourcc, int(fps), (frame_size[1], frame_size[0]))
-
-    def add_frame(self, frame):
-        self.video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
     def add_frame_with_reward(self, frame, reward):
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -55,10 +52,7 @@ class HParamCallback(BaseCallback):
             if isinstance(v, str) and v.isnumeric():
                 hparam_dict[k] = int(v)
             elif isinstance(v, dict):
-                hparam_dict[k] = dict()
-                for k_inner, v_inner in v.items():
-                    hparam_dict[k][k_inner] = v_inner.__str__()
-                hparam_dict[k] = str(hparam_dict[k])
+                hparam_dict[k] = str(v)
             else:
                 hparam_dict[k] = v.__str__()
         metric_dict = {
@@ -72,65 +66,81 @@ class HParamCallback(BaseCallback):
         return True
 
 class TensorboardCallback(BaseCallback):
+    """
+    A comprehensive callback that logs per-step, per-episode, and per-rollout metrics to TensorBoard.
+    """
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.episode_rewards = []
-        self.episode_speeds = []
-        self.episode_count = 0
+        self.episode_lengths = []
+        self.current_episode_reward = 0
+        self.current_episode_length = 0
 
     def _on_step(self) -> bool:
+        # Get the info dict from the environment
         info = self.locals['infos'][0]
-        done = self.locals['dones'][0]
-        reward = self.locals['rewards'][0]
-        self.episode_rewards.append(reward)
-        if 'speed_ms' in info:
-            self.episode_speeds.append(info['speed_ms'])
+        
+        # Accumulate rewards and lengths for the current episode
+        # Note: self.locals['rewards'] contains the unweighted base reward
+        self.current_episode_reward += self.locals['rewards'][0]
+        self.current_episode_length += 1
 
-        # Log per-step metrics
-        if 'speed_ms' in info:
-            self.logger.record("custom/speed_ms", info['speed_ms'])
-        if 'reward' in info:
-            self.logger.record("custom/step_reward", info['reward'])
-        if 'safety_reward' in info:
-            self.logger.record("custom/safety_reward", info['safety_reward'])
-        if 'progress_reward' in info:
-            self.logger.record("custom/progress_reward", info['progress_reward'])
-        if 'smoothness_reward' in info:
-            self.logger.record("custom/smoothness_reward", info['smoothness_reward'])
-        if 'collision_penalty' in info:
-            self.logger.record("custom/collision_penalty", info['collision_penalty'])
-        # Log synthetic_reward, default to 0.0 if missing
-        self.logger.record("custom/synthetic_reward", info.get('synthetic_reward', 0.0))
-        if 'total_reward' in info:
-            self.logger.record("custom/total_reward", info['total_reward'])
-        if 'pedestrian_distance' in info:
-            self.logger.record("custom/pedestrian_distance", info['pedestrian_distance'])
-        if 'distance_to_goal' in info:
-            self.logger.record("custom/distance_to_goal", info['distance_to_goal'])
+        # Check if the episode has ended
+        if self.locals['dones'][0]:
+            self.episode_rewards.append(self.current_episode_reward)
+            self.episode_lengths.append(self.current_episode_length)
+            self.current_episode_reward = 0
+            self.current_episode_length = 0
 
-        # Log episode metrics when done
-        if done:
-            self.episode_count += 1
-            episode_length = len(self.episode_rewards)
-            total_reward = sum(self.episode_rewards)
-            mean_reward = total_reward / episode_length if episode_length > 0 else 0
-            avg_speed = np.mean(self.episode_speeds) if self.episode_speeds else 0
-            self.logger.record("custom/episode_count", self.episode_count)
-            self.logger.record("custom/total_reward", total_reward)
-            self.logger.record("custom/mean_reward", mean_reward)
-            self.logger.record("custom/episode_length", episode_length)
-            self.logger.record("custom/avg_speed", avg_speed)
-            self.logger.record("custom/collision_detected", 1 if info.get('collision_detected', False) else 0)
-            self.logger.record("custom/successful_ep", info.get('successful_ep', 0))
-            self.logger.record("custom/collision_ep", info.get('collision_ep', 0))
-            self.logger.record("custom/stall_ep", info.get('stall_ep', 0))
-            self.logger.record("custom/lane_ep", info.get('lane_ep', 0))
-            self.logger.record("time/num_timesteps", self.num_timesteps)
-            self.episode_rewards = []
-            self.episode_speeds = []
-
-        self.logger.dump(self.num_timesteps)
         return True
+
+    def _on_rollout_end(self) -> None:
+        """
+        This method is called at the end of each rollout after all rewards have been calculated.
+        """
+        buffer = self.model.rollout_buffer
+        if buffer.pos == 0:
+            return
+
+        # --- Log Mean Per-Episode Statistics for the Rollout ---
+        if self.episode_rewards:
+            self.logger.record("rollout/ep_rew_mean", np.mean(self.episode_rewards))
+            self.logger.record("rollout/ep_len_mean", np.mean(self.episode_lengths))
+            # Clear the lists for the next rollout
+            self.episode_rewards = []
+            self.episode_lengths = []
+
+        # --- Log Total Reward Components for the Entire Rollout ---
+        # Note: buffer.rewards contains the final, fully-calculated reward
+        total_final_reward = np.sum(buffer.rewards[:buffer.pos])
+        
+        # Calculate other components by iterating through the stored info dicts
+        total_base_reward = 0
+        total_weighted_base_reward = 0
+        for i in range(buffer.pos):
+            info = buffer.infos[i][0]
+            c1 = info.get("safety_reward", 0)
+            c2 = info.get("progress_reward", 0)
+            c3 = info.get("smoothness_reward", 0)
+            col = info.get("collision_penalty", 0)
+            
+            total_base_reward += (c1 + c2 + c3 + col)
+            
+            w1 = info.get("w1_safety", 1.0)
+            w2 = info.get("w2_comfort", 1.0)
+            w3 = info.get("w3_efficiency", 1.0)
+            total_weighted_base_reward += (w1 * c1) + (w2 * c2) + (w3 * c3) + col
+
+        total_synthetic_reward = total_final_reward - total_weighted_base_reward
+
+        # Record the totals for the rollout
+        self.logger.record("rollout_total/final_reward", total_final_reward)
+        self.logger.record("rollout_total/base_reward", total_base_reward)
+        self.logger.record("rollout_total/weighted_base_reward", total_weighted_base_reward)
+        self.logger.record("rollout_total/synthetic_reward", total_synthetic_reward)
+        
+        self.logger.dump(self.num_timesteps)
+
 
 class VideoRecorderCallback(BaseCallback):
     def __init__(self, video_path, frame_size, video_length=-1, fps=30, skip_frame=1, verbose=0):
@@ -190,14 +200,14 @@ class HistoryWrapperObsDict(gym.Wrapper):
     def reset(self, **kwargs):
         self.obs_history[...] = 0
         self.action_history[...] = 0
-        obs_dict = self.env.reset(**kwargs)
+        obs_dict, info = self.env.reset(**kwargs)
         obs = obs_dict[self.obs_key]
         self.obs_history[..., -obs.shape[-1]:] = obs
         obs_dict[self.obs_key] = self._create_obs_from_history()
-        return obs_dict, {}
+        return obs_dict, info
 
     def step(self, action):
-        obs_dict, reward, done, info = self.env.step(action)
+        obs_dict, reward, done, truncated, info = self.env.step(action)
         obs = obs_dict[self.obs_key]
         last_ax_size = obs.shape[-1]
         self.obs_history = np.roll(self.obs_history, shift=-last_ax_size, axis=-1)
@@ -205,7 +215,7 @@ class HistoryWrapperObsDict(gym.Wrapper):
         self.action_history = np.roll(self.action_history, shift=-action.shape[-1], axis=-1)
         self.action_history[..., -action.shape[-1]:] = action
         obs_dict[self.obs_key] = self._create_obs_from_history()
-        return obs_dict, reward, done, False, info
+        return obs_dict, reward, done, truncated, info
 
 class FrameSkip(gym.Wrapper):
     def __init__(self, env: gym.Env, skip: int = 4):
@@ -216,11 +226,11 @@ class FrameSkip(gym.Wrapper):
     def step(self, action: np.ndarray):
         total_reward = 0.0
         for _ in range(self._skip):
-            obs, reward, done, info = self.env.step(action)
+            obs, reward, done, truncated, info = self.env.step(action)
             total_reward += reward
             if done:
                 break
-        return obs, total_reward, done, info
+        return obs, total_reward, done, truncated, info
 
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)

@@ -94,7 +94,7 @@ vlm_params = {
         batch_size=8,
         max_new_tokens=32,
         clip_size=3,  # Number of frames per short clip
-        step_size=1,  # Step size for the rolling clip window
+        step_size=3,  # Step size for the rolling clip window
     ),
 }
 

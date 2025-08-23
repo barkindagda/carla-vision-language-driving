@@ -18,8 +18,8 @@ from environment.controller import PIDLateralController
 # Configuration constants
 IM_WIDTH = 384
 IM_HEIGHT = 384
-SPAWN_LOCATIONS = "/home/server00/BARKIN/carla-vision-language-driving/environment/spawn_locations_v2.xml"
-ROUTES = "/home/server00/BARKIN/carla-vision-language-driving/environment/routes.xml"
+SPAWN_LOCATIONS = "/home/server01/BARKIN/carla-vision-language-driving/environment/spawn_locations_v2.xml"
+ROUTES = "/home/server01/BARKIN/carla-vision-language-driving/environment/routes.xml"
 TRAFFIC = True
 OCCLUSION = True
 MOVING_OCC = False
