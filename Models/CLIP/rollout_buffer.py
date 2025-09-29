@@ -29,7 +29,7 @@ class VLMRolloutBuffer(RolloutBuffer):
         self.beta = beta
         self.kappa = kappa
         self.smooth_alpha = smooth_alpha
-        self.weights = weights or {"safety": 0.5, "comfort": 0.3, "efficiency": 0.2}
+        self.weights = weights or {"safety": 1.15, "comfort": 1, "efficiency": 1.1}
         self.render_arrays = None
         self.base_rewards = None
         self.shaping_terms = None
