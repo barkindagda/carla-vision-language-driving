@@ -20,7 +20,7 @@ parser.add_argument("--port", default=2000, type=int, help="TCP port to listen t
 parser.add_argument("--total_timesteps", type=int, default=100_000, help="Total timesteps to train for")
 parser.add_argument("--start_carla", action="store_true", help="If True, start a CARLA server")
 parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
-parser.add_argument("--num_checkpoints", type=int, default=100, help="Checkpoint number")
+parser.add_argument("--num_checkpoints", type=int, default=10, help="Checkpoint number")
 parser.add_argument("--log_dir", type=str, default="tensorboard", help="Directory to save logs")
 parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
 parser.add_argument("--config", type=str, default="carla_ppo", help="Config to use (default: carla_ppo)")
